@@ -12,11 +12,17 @@ export const damageEvent = new hz.LocalEvent<{
 /**
  * TargetHealth
  * ------------
- * Attach to the EMPTY root object of a target. Expects two collidable
- * children tagged "head" and "body", plus a health bar fill object.
+ * Attach to the EMPTY root object of a target ("Target"), which must be set
+ * to Motion: Animated. Expects two collidable children tagged "head" and
+ * "body", plus a health bar fill object.
+ *
+ * Health and chasing live in one component because this editor build only
+ * allows a single script per entity. That also makes death stop the walk
+ * without needing an event between scripts.
  */
 class TargetHealth extends hz.Component<typeof TargetHealth> {
   static propsDefinition = {
+    // --- health ---------------------------------------------------------
     maxHealth: { type: hz.PropTypes.Number, default: 100 },
 
     // Coloured cube that shrinks. Sibling of the bar background, both
@@ -32,6 +38,16 @@ class TargetHealth extends hz.Component<typeof TargetHealth> {
 
     // Seconds after death before the target resets to full health.
     respawnDelay: { type: hz.PropTypes.Number, default: 2 },
+
+    // --- chasing --------------------------------------------------------
+    chaseEnabled: { type: hz.PropTypes.Boolean, default: true },
+    moveSpeed: { type: hz.PropTypes.Number, default: 1.5 }, // metres/second
+    // How close it gets before it stops walking.
+    stopDistance: { type: hz.PropTypes.Number, default: 2 },
+
+    faceThePlayer: { type: hz.PropTypes.Boolean, default: true },
+    // If the model ends up facing sideways, correct it here (try 90/180/270).
+    facingOffsetDegrees: { type: hz.PropTypes.Number, default: 0 },
   };
 
   private health = 0;
@@ -41,8 +57,12 @@ class TargetHealth extends hz.Component<typeof TargetHealth> {
   private fillFullScale: hz.Vec3 | null = null;
   private fillFullPosition: hz.Vec3 | null = null;
 
+  // Height is pinned here so the target cannot drift up or sink.
+  private startY = 0;
+
   start() {
     this.health = this.props.maxHealth;
+    this.startY = this.entity.position.get().y;
 
     const fill = this.props.healthBarFill;
     if (fill) {
@@ -56,8 +76,17 @@ class TargetHealth extends hz.Component<typeof TargetHealth> {
       this.takeDamage(data.amount, data.isHeadshot);
     });
 
+    this.connectLocalBroadcastEvent(
+      hz.World.onUpdate,
+      (data: { deltaTime: number }) => {
+        this.chaseTick(data.deltaTime);
+      },
+    );
+
     this.refreshBar();
   }
+
+  // ---------------------------------------------------------------- health
 
   private takeDamage(amount: number, isHeadshot: boolean) {
     if (this.isDead) {
@@ -121,6 +150,73 @@ class TargetHealth extends hz.Component<typeof TargetHealth> {
     if (text) {
       text.as(hz.TextGizmo)?.text.set(`${this.health} / ${this.props.maxHealth}`);
     }
+  }
+
+  // --------------------------------------------------------------- chasing
+
+  private chaseTick(deltaTime: number) {
+    // Dead targets stand still until they respawn.
+    if (!this.props.chaseEnabled || this.isDead) {
+      return;
+    }
+
+    const myPos = this.entity.position.get();
+    const target = this.nearestPlayerPosition(myPos);
+    if (!target) {
+      return;
+    }
+
+    // Horizontal only - we never want it climbing towards a player's head.
+    const dx = target.x - myPos.x;
+    const dz = target.z - myPos.z;
+    const distance = Math.sqrt(dx * dx + dz * dz);
+    if (distance < 0.001) {
+      return;
+    }
+
+    const nx = dx / distance;
+    const nz = dz / distance;
+
+    if (this.props.faceThePlayer) {
+      const yaw =
+        (Math.atan2(nx, nz) * 180) / Math.PI + this.props.facingOffsetDegrees;
+      this.entity.rotation.set(hz.Quaternion.fromEuler(new hz.Vec3(0, yaw, 0)));
+    }
+
+    if (distance <= this.props.stopDistance) {
+      return;
+    }
+
+    // Never overshoot past stopDistance in a single frame.
+    const step = Math.min(
+      this.props.moveSpeed * deltaTime,
+      distance - this.props.stopDistance,
+    );
+
+    this.entity.position.set(
+      new hz.Vec3(myPos.x + nx * step, this.startY, myPos.z + nz * step),
+    );
+  }
+
+  private nearestPlayerPosition(from: hz.Vec3): hz.Vec3 | null {
+    const players = this.world.getPlayers();
+
+    let nearest: hz.Vec3 | null = null;
+    let nearestDistanceSq = Number.MAX_VALUE;
+
+    for (const player of players) {
+      const position = player.position.get();
+      const dx = position.x - from.x;
+      const dz = position.z - from.z;
+      const distanceSq = dx * dx + dz * dz;
+
+      if (distanceSq < nearestDistanceSq) {
+        nearestDistanceSq = distanceSq;
+        nearest = position;
+      }
+    }
+
+    return nearest;
   }
 }
 
