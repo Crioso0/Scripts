@@ -262,12 +262,36 @@ class TargetHealth extends hz.Component<typeof TargetHealth> {
     agent.destination.set(destination);
 
     if (this.props.debugMovement) {
-      console.log(
-        `TargetHealth: speed ${agent.currentSpeed.get().toFixed(2)} ` +
-          `remaining ${agent.remainingDistance.get().toFixed(2)} ` +
-          `waypoints ${agent.path.get().length}`,
-      );
+      this.logMovementState(destination);
     }
+  }
+
+  /**
+   * "waypoints 0" on its own does not say whether the agent or the target is
+   * the off-mesh one, so probe both with a tight getNearestPoint radius.
+   */
+  private logMovementState(destination: hz.Vec3) {
+    const agent = this.agent;
+    if (!agent) {
+      return;
+    }
+
+    const mesh = this.navMesh;
+    let placement = 'navMesh=NULL (profile not resolved)';
+
+    if (mesh) {
+      const myPos = this.entity.position.get();
+      const agentOnMesh = mesh.getNearestPoint(myPos, 1) != null;
+      const destOnMesh = mesh.getNearestPoint(destination, 1) != null;
+      placement = `agentOnMesh=${agentOnMesh ? 'yes' : 'NO'} destOnMesh=${destOnMesh ? 'yes' : 'NO'}`;
+    }
+
+    console.log(
+      `TargetHealth: ${placement} ` +
+        `speed ${agent.currentSpeed.get().toFixed(2)} ` +
+        `remaining ${agent.remainingDistance.get().toFixed(2)} ` +
+        `waypoints ${agent.path.get().length}`,
+    );
   }
 
   private manualTick(deltaTime: number) {
