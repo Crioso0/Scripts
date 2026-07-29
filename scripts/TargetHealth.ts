@@ -24,8 +24,10 @@ class TargetHealth extends hz.Component<typeof TargetHealth> {
     // Optional Text gizmo showing "80 / 100".
     healthText: { type: hz.PropTypes.Entity },
 
-    headshotSfx: { type: hz.PropTypes.Entity },
-    bodyshotSfx: { type: hz.PropTypes.Entity },
+    // Plays on EVERY successful hit, head or body.
+    hitMarkerSfx: { type: hz.PropTypes.Entity },
+    // Plays only when a headshot is the killing blow.
+    headshotKillSfx: { type: hz.PropTypes.Entity },
 
     // Seconds after death before the target resets to full health.
     respawnDelay: { type: hz.PropTypes.Number, default: 2 },
@@ -61,25 +63,32 @@ class TargetHealth extends hz.Component<typeof TargetHealth> {
       return;
     }
 
+    // Hit marker fires on every connect, regardless of where it landed.
+    this.props.hitMarkerSfx?.as(hz.AudioGizmo)?.play();
+
     this.health = Math.max(0, this.health - amount);
 
-    const sfx = isHeadshot ? this.props.headshotSfx : this.props.bodyshotSfx;
-    sfx?.as(hz.AudioGizmo)?.play();
-
     console.log(
-      `TargetHealth: ${isHeadshot ? 'HEADSHOT' : 'body'} for ${amount} -> ${this.health}/${this.props.maxHealth}`,
+      `TargetHealth: ${isHeadshot ? 'head' : 'body'} for ${amount} -> ${this.health}/${this.props.maxHealth}`,
     );
 
     this.refreshBar();
 
     if (this.health <= 0) {
-      this.die();
+      this.die(isHeadshot);
     }
   }
 
-  private die() {
+  /** killedByHeadshot: was the FINAL shot a headshot? */
+  private die(killedByHeadshot: boolean) {
     this.isDead = true;
-    console.log('TargetHealth: TARGET DOWN');
+
+    if (killedByHeadshot) {
+      this.props.headshotKillSfx?.as(hz.AudioGizmo)?.play();
+      console.log('TargetHealth: HEADSHOT KILL');
+    } else {
+      console.log('TargetHealth: TARGET DOWN');
+    }
 
     this.async.setTimeout(() => {
       this.health = this.props.maxHealth;
