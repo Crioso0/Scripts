@@ -19,7 +19,8 @@ class TargetHealth extends hz.Component<typeof TargetHealth> {
   static propsDefinition = {
     maxHealth: { type: hz.PropTypes.Number, default: 100 },
 
-    // Coloured cube that shrinks. Must be a child of the bar background.
+    // Coloured cube that shrinks. Sibling of the bar background, both
+    // parented to an unscaled empty so the local maths stays clean.
     healthBarFill: { type: hz.PropTypes.Entity },
     // Optional Text gizmo showing "80 / 100".
     healthText: { type: hz.PropTypes.Entity },
