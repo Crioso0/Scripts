@@ -1,5 +1,4 @@
 import * as hz from 'horizon/core';
-import NavMeshManager, { NavMesh, NavMeshAgent } from 'horizon/navmesh';
 
 /**
  * Sent by the gun to whichever entity owns a TargetHealth component.
@@ -17,17 +16,16 @@ export const damageEvent = new hz.LocalEvent<{
  * Expects two collidable children tagged "head" and "body", plus a health
  * bar fill object.
  *
- * Editor requirements for pathfinding:
- *   - Navigation Locomotion -> Enabled = ON
- *   - Navigation -> Include in Bakes = OFF  (otherwise the agent is baked
- *     into the navmesh as an obstacle and blocks its own path)
- *   - A baked navigation profile whose name matches navProfileName
+ * Movement walks straight at the nearest player, but probes the ground just
+ * ahead with a downward raycast each step. That one probe does two jobs:
  *
- * Movement has two modes:
- *   navmesh - hands a destination to a NavMeshAgent, which follows terrain
- *             and paths around obstacles.
- *   manual  - straight-line walk with height pinned to startY. Fallback for
- *             when the navmesh is unavailable.
+ *   - follows terrain height instead of floating at a fixed Y
+ *   - refuses to step where the ground jumps up or drops away, which is what
+ *     a wall or a cliff looks like from the walker's point of view
+ *
+ * There is no pathfinding here, so he presses against walls rather than
+ * routing around them. The NavMeshAgent version lives in git history at
+ * commit da2395a.
  */
 class TargetHealth extends hz.Component<typeof TargetHealth> {
   static propsDefinition = {
@@ -44,22 +42,29 @@ class TargetHealth extends hz.Component<typeof TargetHealth> {
 
     // --- movement -------------------------------------------------------
     chaseEnabled: { type: hz.PropTypes.Boolean, default: true },
-    // Untick to force the old straight-line movement.
-    useNavMesh: { type: hz.PropTypes.Boolean, default: true },
-    // Must match a baked profile in Systems > Navigation.
-    navProfileName: { type: hz.PropTypes.String, default: 'Zombie' },
-
-    moveSpeed: { type: hz.PropTypes.Number, default: 1.5 },
-    // How close it gets before it stops. The agent decelerates into this.
+    moveSpeed: { type: hz.PropTypes.Number, default: 1.5 }, // metres/second
     stopDistance: { type: hz.PropTypes.Number, default: 2 },
-    // Repathing every frame is wasteful; interval in seconds.
-    repathInterval: { type: hz.PropTypes.Number, default: 0.25 },
-    // How far to search for a navmesh point near an off-mesh player.
-    snapRange: { type: hz.PropTypes.Number, default: 8 },
 
-    // Manual-mode only. The agent handles its own facing.
     faceThePlayer: { type: hz.PropTypes.Boolean, default: true },
+    // If the model faces sideways, correct it here (try 90/180/270).
     facingOffsetDegrees: { type: hz.PropTypes.Number, default: 0 },
+
+    // --- ground probe ---------------------------------------------------
+    // The Raycast gizmo. Reusing the gun's is fine.
+    groundRaycast: { type: hz.PropTypes.Entity },
+    // How far ahead to look. Must clear his own body, or the probe hits him.
+    probeAhead: { type: hz.PropTypes.Number, default: 0.6 },
+    // Start the downward ray this far above him, to catch ground above too.
+    probeHeight: { type: hz.PropTypes.Number, default: 1.5 },
+    // How far below to keep looking before giving up.
+    maxDrop: { type: hz.PropTypes.Number, default: 5 },
+
+    // Ground rising more than this is treated as a wall - refuse to move.
+    maxStepUp: { type: hz.PropTypes.Number, default: 0.5 },
+    // Ground falling more than this is treated as a cliff - refuse to move.
+    maxStepDown: { type: hz.PropTypes.Number, default: 1 },
+    // Trim if he sinks into or floats above the ground.
+    groundOffset: { type: hz.PropTypes.Number, default: 0 },
 
     debugMovement: { type: hz.PropTypes.Boolean, default: false },
   };
@@ -71,16 +76,16 @@ class TargetHealth extends hz.Component<typeof TargetHealth> {
   private fillFullScale: hz.Vec3 | null = null;
   private fillFullPosition: hz.Vec3 | null = null;
 
-  // Manual mode pins height here so the target cannot drift or sink.
-  private startY = 0;
-
-  private agent: NavMeshAgent | null = null;
-  private navMesh: NavMesh | null = null;
-  private repathCountdown = 0;
+  /**
+   * Height of this entity's origin above the ground, measured on the first
+   * successful probe. The root's pivot may sit at the waist rather than the
+   * feet, so we preserve whatever offset it was placed with instead of
+   * dropping the pivot onto the surface.
+   */
+  private footOffset: number | null = null;
 
   start() {
     this.health = this.props.maxHealth;
-    this.startY = this.entity.position.get().y;
 
     const fill = this.props.healthBarFill;
     if (fill) {
@@ -90,8 +95,11 @@ class TargetHealth extends hz.Component<typeof TargetHealth> {
       console.warn('TargetHealth: healthBarFill prop is not set.');
     }
 
-    if (this.props.useNavMesh) {
-      this.setUpAgent();
+    if (!this.props.groundRaycast) {
+      console.warn(
+        'TargetHealth: groundRaycast prop is not set. The target will walk ' +
+          'at a fixed height and clip through terrain.',
+      );
     }
 
     this.connectLocalEvent(this.entity, damageEvent, (data) => {
@@ -106,37 +114,6 @@ class TargetHealth extends hz.Component<typeof TargetHealth> {
     );
 
     this.refreshBar();
-  }
-
-  // -------------------------------------------------------------- navmesh
-
-  private setUpAgent() {
-    // Note: as() returns a wrapper whether or not Navigation Locomotion is
-    // enabled, so this succeeding is not proof the editor side is set up.
-    this.agent = this.entity.as(NavMeshAgent);
-
-    const profileName = this.props.navProfileName;
-
-    this.agent.profileName.set(profileName);
-    this.agent.isImmobile.set(false);
-    this.agent.maxSpeed.set(this.props.moveSpeed);
-    this.agent.stoppingDistance.set(this.props.stopDistance);
-
-    // The mesh reference is only needed for getNearestPoint, which is what
-    // lets us chase a player standing on unbaked ground.
-    NavMeshManager.getInstance(this.world)
-      .getByName(profileName)
-      .then((mesh) => {
-        this.navMesh = mesh;
-        if (mesh) {
-          console.log(`TargetHealth: navmesh "${profileName}" ready.`);
-        } else {
-          console.warn(
-            `TargetHealth: no navigation profile named "${profileName}". ` +
-              'Check the name in Systems > Navigation matches exactly.',
-          );
-        }
-      });
   }
 
   // ---------------------------------------------------------------- health
@@ -172,9 +149,6 @@ class TargetHealth extends hz.Component<typeof TargetHealth> {
     } else {
       console.log('TargetHealth: TARGET DOWN');
     }
-
-    // Clearing the destination is the documented way to halt an agent.
-    this.agent?.destination.set(null);
 
     this.async.setTimeout(() => {
       this.health = this.props.maxHealth;
@@ -215,86 +189,6 @@ class TargetHealth extends hz.Component<typeof TargetHealth> {
       return;
     }
 
-    if (this.props.useNavMesh && this.agent) {
-      this.navMeshTick(deltaTime);
-    } else {
-      this.manualTick(deltaTime);
-    }
-  }
-
-  private navMeshTick(deltaTime: number) {
-    this.repathCountdown -= deltaTime;
-    if (this.repathCountdown > 0) {
-      return;
-    }
-    this.repathCountdown = this.props.repathInterval;
-
-    const agent = this.agent;
-    if (!agent) {
-      return;
-    }
-
-    const playerPosition = this.nearestPlayerPosition(this.entity.position.get());
-    if (!playerPosition) {
-      return;
-    }
-
-    // A destination off the navigable surface yields no path at all, so snap
-    // it onto the mesh first. Players stand on decks, boxes, and stairs that
-    // were never baked.
-    let destination: hz.Vec3 | null = playerPosition;
-    if (this.navMesh) {
-      destination = this.navMesh.getNearestPoint(
-        playerPosition,
-        this.props.snapRange,
-      );
-    }
-
-    if (!destination) {
-      if (this.props.debugMovement) {
-        console.log(
-          'TargetHealth: no navmesh point within snapRange of the player.',
-        );
-      }
-      return;
-    }
-
-    agent.destination.set(destination);
-
-    if (this.props.debugMovement) {
-      this.logMovementState(destination);
-    }
-  }
-
-  /**
-   * "waypoints 0" on its own does not say whether the agent or the target is
-   * the off-mesh one, so probe both with a tight getNearestPoint radius.
-   */
-  private logMovementState(destination: hz.Vec3) {
-    const agent = this.agent;
-    if (!agent) {
-      return;
-    }
-
-    const mesh = this.navMesh;
-    let placement = 'navMesh=NULL (profile not resolved)';
-
-    if (mesh) {
-      const myPos = this.entity.position.get();
-      const agentOnMesh = mesh.getNearestPoint(myPos, 1) != null;
-      const destOnMesh = mesh.getNearestPoint(destination, 1) != null;
-      placement = `agentOnMesh=${agentOnMesh ? 'yes' : 'NO'} destOnMesh=${destOnMesh ? 'yes' : 'NO'}`;
-    }
-
-    console.log(
-      `TargetHealth: ${placement} ` +
-        `speed ${agent.currentSpeed.get().toFixed(2)} ` +
-        `remaining ${agent.remainingDistance.get().toFixed(2)} ` +
-        `waypoints ${agent.path.get().length}`,
-    );
-  }
-
-  private manualTick(deltaTime: number) {
     const myPos = this.entity.position.get();
     const target = this.nearestPlayerPosition(myPos);
     if (!target) {
@@ -328,9 +222,101 @@ class TargetHealth extends hz.Component<typeof TargetHealth> {
       distance - this.props.stopDistance,
     );
 
-    this.entity.position.set(
-      new hz.Vec3(myPos.x + nx * step, this.startY, myPos.z + nz * step),
+    const nextX = myPos.x + nx * step;
+    const nextZ = myPos.z + nz * step;
+
+    const groundY = this.probeGround(myPos, nx, nz);
+
+    if (groundY == null) {
+      // No ground reading: hold height rather than guess.
+      this.entity.position.set(new hz.Vec3(nextX, myPos.y, nextZ));
+      return;
+    }
+
+    if (this.footOffset == null) {
+      this.footOffset = myPos.y - groundY;
+      if (this.props.debugMovement) {
+        console.log(
+          `TargetHealth: calibrated footOffset ${this.footOffset.toFixed(2)}m`,
+        );
+      }
+    }
+
+    const desiredY = groundY + this.footOffset + this.props.groundOffset;
+    const rise = desiredY - myPos.y;
+
+    if (rise > this.props.maxStepUp) {
+      if (this.props.debugMovement) {
+        console.log(
+          `TargetHealth: blocked - ground ahead rises ${rise.toFixed(2)}m`,
+        );
+      }
+      return;
+    }
+
+    if (rise < -this.props.maxStepDown) {
+      if (this.props.debugMovement) {
+        console.log(
+          `TargetHealth: blocked - ground ahead drops ${(-rise).toFixed(2)}m`,
+        );
+      }
+      return;
+    }
+
+    this.entity.position.set(new hz.Vec3(nextX, desiredY, nextZ));
+  }
+
+  /**
+   * Casts down onto the ground a short way ahead of the target.
+   *
+   * The probe starts ahead of and above him so it clears his own colliders;
+   * a ray starting inside his body would just hit his own hitboxes.
+   *
+   * @returns the ground height, or null if nothing was found.
+   */
+  private probeGround(
+    from: hz.Vec3,
+    dirX: number,
+    dirZ: number,
+  ): number | null {
+    const gizmo = this.props.groundRaycast?.as(hz.RaycastGizmo);
+    if (!gizmo) {
+      return null;
+    }
+
+    const origin = new hz.Vec3(
+      from.x + dirX * this.props.probeAhead,
+      from.y + this.props.probeHeight,
+      from.z + dirZ * this.props.probeAhead,
     );
+
+    const hit = gizmo.raycast(origin, new hz.Vec3(0, -1, 0), {
+      layerType: hz.LayerType.Both,
+      maxDistance: this.props.probeHeight + this.props.maxDrop,
+    });
+
+    if (hit == null) {
+      return null;
+    }
+
+    // Guard against probing our own body if probeAhead is set too small.
+    if (hit.targetType === hz.RaycastTargetType.Entity) {
+      const name = hit.target.name.get();
+      if (
+        hit.target.tags.contains('head') ||
+        hit.target.tags.contains('body')
+      ) {
+        if (this.props.debugMovement) {
+          console.log(
+            `TargetHealth: ground probe hit own hitbox "${name}" - ` +
+              'increase probeAhead.',
+          );
+        }
+        return null;
+      }
+    }
+
+    return hit.hitPoint.y;
   }
 
   private nearestPlayerPosition(from: hz.Vec3): hz.Vec3 | null {
