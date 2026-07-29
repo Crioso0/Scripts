@@ -1,11 +1,18 @@
 import * as hz from 'horizon/core';
 import { damageEvent } from 'TargetHealth';
 
+/** Local axes of the muzzle we can fire along. */
+const AIM_AXES = ['forward', 'back', 'right', 'left', 'up', 'down'];
+
 class SimpleGun extends hz.Component<typeof SimpleGun> {
   static propsDefinition = {
     muzzle: { type: hz.PropTypes.Entity },
     gunshotSfx: { type: hz.PropTypes.Entity },
     raycastGizmo: { type: hz.PropTypes.Entity },
+
+    // Which local axis of Muzzle_point runs down the barrel.
+    // One of: forward, back, right, left, up, down
+    aimAxis: { type: hz.PropTypes.String, default: 'forward' },
 
     damagePerShot: { type: hz.PropTypes.Number, default: 25 },
     headshotMultiplier: { type: hz.PropTypes.Number, default: 2 },
@@ -13,10 +20,9 @@ class SimpleGun extends hz.Component<typeof SimpleGun> {
     fireCooldown: { type: hz.PropTypes.Number, default: 0.35 },
     maxRange: { type: hz.PropTypes.Number, default: 100 },
 
-    // Set false once everything works to quieten the console.
     debug: { type: hz.PropTypes.Boolean, default: true },
-    // Diagnostic only: point this at the Target to measure how far the
-    // muzzle's forward axis is from actually aiming at it.
+    // Diagnostic only: set this to the Target so the script can report which
+    // axis actually points at it.
     aimCheckTarget: { type: hz.PropTypes.Entity },
   };
 
@@ -55,9 +61,10 @@ class SimpleGun extends hz.Component<typeof SimpleGun> {
     }
 
     const origin = muzzle.position.get();
-    const direction = muzzle.forward.get();
-    this.log(`fire from ${origin.toString()} dir ${direction.toString()}`);
-    this.logAimError(origin, direction);
+    const direction = this.axisVector(muzzle, this.props.aimAxis);
+
+    this.log(`fire along "${this.props.aimAxis}" dir ${direction.toString()}`);
+    this.logAllAxisErrors(muzzle, origin);
 
     const hit = gizmo.raycast(origin, direction, {
       layerType: hz.LayerType.Both,
@@ -70,8 +77,6 @@ class SimpleGun extends hz.Component<typeof SimpleGun> {
     }
 
     if (hit.targetType !== hz.RaycastTargetType.Entity) {
-      // targetType 2 is static world geometry. Logging where it landed tells
-      // us whether we clipped a wall or hit a hitbox left on Motion: None.
       this.log(
         `hit a non-entity (targetType=${hit.targetType}) at ` +
           `${hit.hitPoint.toString()}, ${hit.distance.toFixed(2)}m away`,
@@ -103,14 +108,35 @@ class SimpleGun extends hz.Component<typeof SimpleGun> {
     });
   }
 
+  /** World-space direction of one of the muzzle's local axes. */
+  private axisVector(muzzle: hz.Entity, axis: string): hz.Vec3 {
+    switch (axis) {
+      case 'back': {
+        const v = muzzle.forward.get();
+        return new hz.Vec3(-v.x, -v.y, -v.z);
+      }
+      case 'right':
+        return muzzle.right.get();
+      case 'left': {
+        const v = muzzle.right.get();
+        return new hz.Vec3(-v.x, -v.y, -v.z);
+      }
+      case 'up':
+        return muzzle.up.get();
+      case 'down': {
+        const v = muzzle.up.get();
+        return new hz.Vec3(-v.x, -v.y, -v.z);
+      }
+      default:
+        return muzzle.forward.get();
+    }
+  }
+
   /**
-   * Diagnostic: compare the muzzle's forward axis against the direction the
-   * target actually lies in. Near 0 degrees means the muzzle is aimed
-   * correctly; a large angle means Muzzle_point needs rotating.
-   * Written with plain component maths to avoid depending on Vec3 helper
-   * semantics.
+   * Diagnostic: report how far each of the six local axes is from pointing at
+   * the target. The smallest angle names the axis to put in aimAxis.
    */
-  private logAimError(origin: hz.Vec3, direction: hz.Vec3) {
+  private logAllAxisErrors(muzzle: hz.Entity, origin: hz.Vec3) {
     const check = this.props.aimCheckTarget;
     if (!check || !this.props.debug) {
       return;
@@ -126,14 +152,14 @@ class SimpleGun extends hz.Component<typeof SimpleGun> {
       return;
     }
 
-    const dot =
-      (direction.x * dx + direction.y * dy + direction.z * dz) / distance;
-    const angle = (Math.acos(Math.max(-1, Math.min(1, dot))) * 180) / Math.PI;
+    this.log(`  aim check - target is ${distance.toFixed(2)}m away`);
 
-    this.log(
-      `  aim check: target ${distance.toFixed(2)}m away, muzzle is ` +
-        `${angle.toFixed(1)} degrees off from pointing at it`,
-    );
+    for (const axis of AIM_AXES) {
+      const v = this.axisVector(muzzle, axis);
+      const dot = (v.x * dx + v.y * dy + v.z * dz) / distance;
+      const angle = (Math.acos(Math.max(-1, Math.min(1, dot))) * 180) / Math.PI;
+      this.log(`    ${axis}: ${angle.toFixed(1)} degrees off`);
+    }
   }
 
   /**
