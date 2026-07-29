@@ -1,5 +1,5 @@
 import * as hz from 'horizon/core';
-import * as nav from 'horizon/navmesh';
+import NavMeshManager, { NavMesh, NavMeshAgent } from 'horizon/navmesh';
 
 /**
  * Sent by the gun to whichever entity owns a TargetHealth component.
@@ -17,12 +17,17 @@ export const damageEvent = new hz.LocalEvent<{
  * Expects two collidable children tagged "head" and "body", plus a health
  * bar fill object.
  *
+ * Editor requirements for pathfinding:
+ *   - Navigation Locomotion -> Enabled = ON
+ *   - Navigation -> Include in Bakes = OFF  (otherwise the agent is baked
+ *     into the navmesh as an obstacle and blocks its own path)
+ *   - A baked navigation profile whose name matches navProfileName
+ *
  * Movement has two modes:
- *   navmesh  - hands a destination to a NavMeshAgent, which follows terrain
- *              and paths around obstacles. Requires a baked navigation
- *              profile and Navigation Locomotion enabled on this entity.
- *   manual   - the old straight-line walk with height pinned to startY.
- *              Kept as a fallback for when there is no agent.
+ *   navmesh - hands a destination to a NavMeshAgent, which follows terrain
+ *             and paths around obstacles.
+ *   manual  - straight-line walk with height pinned to startY. Fallback for
+ *             when the navmesh is unavailable.
  */
 class TargetHealth extends hz.Component<typeof TargetHealth> {
   static propsDefinition = {
@@ -41,16 +46,22 @@ class TargetHealth extends hz.Component<typeof TargetHealth> {
     chaseEnabled: { type: hz.PropTypes.Boolean, default: true },
     // Untick to force the old straight-line movement.
     useNavMesh: { type: hz.PropTypes.Boolean, default: true },
+    // Must match a baked profile in Systems > Navigation.
+    navProfileName: { type: hz.PropTypes.String, default: 'Zombie' },
 
-    // How close it gets before it stops walking.
-    stopDistance: { type: hz.PropTypes.Number, default: 2 },
-    // Repathing every frame is wasteful; this is the interval in seconds.
-    repathInterval: { type: hz.PropTypes.Number, default: 0.25 },
-
-    // Manual-mode only. The agent handles its own speed and facing.
     moveSpeed: { type: hz.PropTypes.Number, default: 1.5 },
+    // How close it gets before it stops. The agent decelerates into this.
+    stopDistance: { type: hz.PropTypes.Number, default: 2 },
+    // Repathing every frame is wasteful; interval in seconds.
+    repathInterval: { type: hz.PropTypes.Number, default: 0.25 },
+    // How far to search for a navmesh point near an off-mesh player.
+    snapRange: { type: hz.PropTypes.Number, default: 8 },
+
+    // Manual-mode only. The agent handles its own facing.
     faceThePlayer: { type: hz.PropTypes.Boolean, default: true },
     facingOffsetDegrees: { type: hz.PropTypes.Number, default: 0 },
+
+    debugMovement: { type: hz.PropTypes.Boolean, default: false },
   };
 
   private health = 0;
@@ -63,7 +74,8 @@ class TargetHealth extends hz.Component<typeof TargetHealth> {
   // Manual mode pins height here so the target cannot drift or sink.
   private startY = 0;
 
-  private agent: nav.NavMeshAgent | null = null;
+  private agent: NavMeshAgent | null = null;
+  private navMesh: NavMesh | null = null;
   private repathCountdown = 0;
 
   start() {
@@ -78,14 +90,8 @@ class TargetHealth extends hz.Component<typeof TargetHealth> {
       console.warn('TargetHealth: healthBarFill prop is not set.');
     }
 
-    this.agent = this.entity.as(nav.NavMeshAgent);
-    if (this.agent) {
-      console.log('TargetHealth: NavMeshAgent found - using pathfinding.');
-    } else {
-      console.warn(
-        'TargetHealth: no NavMeshAgent on this entity. Falling back to ' +
-          'straight-line movement. Check Navigation Locomotion is enabled.',
-      );
+    if (this.props.useNavMesh) {
+      this.setUpAgent();
     }
 
     this.connectLocalEvent(this.entity, damageEvent, (data) => {
@@ -100,6 +106,37 @@ class TargetHealth extends hz.Component<typeof TargetHealth> {
     );
 
     this.refreshBar();
+  }
+
+  // -------------------------------------------------------------- navmesh
+
+  private setUpAgent() {
+    // Note: as() returns a wrapper whether or not Navigation Locomotion is
+    // enabled, so this succeeding is not proof the editor side is set up.
+    this.agent = this.entity.as(NavMeshAgent);
+
+    const profileName = this.props.navProfileName;
+
+    this.agent.profileName.set(profileName);
+    this.agent.isImmobile.set(false);
+    this.agent.maxSpeed.set(this.props.moveSpeed);
+    this.agent.stoppingDistance.set(this.props.stopDistance);
+
+    // The mesh reference is only needed for getNearestPoint, which is what
+    // lets us chase a player standing on unbaked ground.
+    NavMeshManager.getInstance(this.world)
+      .getByName(profileName)
+      .then((mesh) => {
+        this.navMesh = mesh;
+        if (mesh) {
+          console.log(`TargetHealth: navmesh "${profileName}" ready.`);
+        } else {
+          console.warn(
+            `TargetHealth: no navigation profile named "${profileName}". ` +
+              'Check the name in Systems > Navigation matches exactly.',
+          );
+        }
+      });
   }
 
   // ---------------------------------------------------------------- health
@@ -136,7 +173,8 @@ class TargetHealth extends hz.Component<typeof TargetHealth> {
       console.log('TargetHealth: TARGET DOWN');
     }
 
-    this.stopMoving();
+    // Clearing the destination is the documented way to halt an agent.
+    this.agent?.destination.set(null);
 
     this.async.setTimeout(() => {
       this.health = this.props.maxHealth;
@@ -184,11 +222,6 @@ class TargetHealth extends hz.Component<typeof TargetHealth> {
     }
   }
 
-  /** Parking the destination on our own position is how an agent is told to stop. */
-  private stopMoving() {
-    this.agent?.destination.set(this.entity.position.get());
-  }
-
   private navMeshTick(deltaTime: number) {
     this.repathCountdown -= deltaTime;
     if (this.repathCountdown > 0) {
@@ -196,22 +229,45 @@ class TargetHealth extends hz.Component<typeof TargetHealth> {
     }
     this.repathCountdown = this.props.repathInterval;
 
-    const myPos = this.entity.position.get();
-    const target = this.nearestPlayerPosition(myPos);
-    if (!target) {
+    const agent = this.agent;
+    if (!agent) {
       return;
     }
 
-    const dx = target.x - myPos.x;
-    const dz = target.z - myPos.z;
-    const distance = Math.sqrt(dx * dx + dz * dz);
-
-    if (distance <= this.props.stopDistance) {
-      this.stopMoving();
+    const playerPosition = this.nearestPlayerPosition(this.entity.position.get());
+    if (!playerPosition) {
       return;
     }
 
-    this.agent?.destination.set(target);
+    // A destination off the navigable surface yields no path at all, so snap
+    // it onto the mesh first. Players stand on decks, boxes, and stairs that
+    // were never baked.
+    let destination: hz.Vec3 | null = playerPosition;
+    if (this.navMesh) {
+      destination = this.navMesh.getNearestPoint(
+        playerPosition,
+        this.props.snapRange,
+      );
+    }
+
+    if (!destination) {
+      if (this.props.debugMovement) {
+        console.log(
+          'TargetHealth: no navmesh point within snapRange of the player.',
+        );
+      }
+      return;
+    }
+
+    agent.destination.set(destination);
+
+    if (this.props.debugMovement) {
+      console.log(
+        `TargetHealth: speed ${agent.currentSpeed.get().toFixed(2)} ` +
+          `remaining ${agent.remainingDistance.get().toFixed(2)} ` +
+          `waypoints ${agent.path.get().length}`,
+      );
+    }
   }
 
   private manualTick(deltaTime: number) {
