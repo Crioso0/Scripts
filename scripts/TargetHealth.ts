@@ -1,4 +1,5 @@
 import * as hz from 'horizon/core';
+import { NavMeshAgent } from 'horizon/navmesh';
 
 /**
  * Sent by the gun to whichever entity owns a TargetHealth component.
@@ -9,9 +10,6 @@ export const damageEvent = new hz.LocalEvent<{
   isHeadshot: boolean;
 }>('damage');
 
-/** Whisker angles tried in order, smallest deviation first. */
-const STEER_ANGLES = [30, 60, 90, 120, 150];
-
 /**
  * TargetHealth
  * ------------
@@ -19,22 +17,20 @@ const STEER_ANGLES = [30, 60, 90, 120, 150];
  * Expects two collidable children tagged "head" and "body", plus a health
  * bar fill object.
  *
- * Movement steers toward the nearest player using whisker probes. Each
- * candidate heading is tested with two raycasts:
+ * Editor requirements:
+ *   - Navigation Locomotion -> Enabled = ON
+ *   - Navigation -> Include in Bakes = OFF on this entity and all children,
+ *     or the target is baked into the navmesh as an obstacle
+ *   - A baked navigation profile named to match navProfileName, whose volume
+ *     actually covers the floor the target stands on
  *
- *   - a downward probe just ahead, giving terrain height and rejecting steps
- *     that rise or fall too sharply
- *   - a short horizontal ray at chest height, catching walls the downward
- *     probe passes over
+ * Destinations are the player's raw position, matching Meta's own NPCMonster
+ * sample. An earlier version ran them through NavMesh.getNearestPoint first,
+ * which made the target chase a snapped point metres away whenever the player
+ * stood on unbaked ground.
  *
- * The closest walkable heading to "straight at the player" wins, so a blocked
- * target slides along a wall until it clears. Once it has committed to going
- * around one side it sticks with that side briefly, otherwise it oscillates
- * left-right against a flat wall.
- *
- * This handles convex obstacles. It has no memory of where it has been, so a
- * concave dead-end can still trap it - that is where a NavMeshAgent earns its
- * setup cost. That implementation is preserved in git at commit da2395a.
+ * The raycast steering version (terrain probes, no navmesh) is preserved in
+ * git at commit e29c930 if this needs to be swapped back out.
  */
 class TargetHealth extends hz.Component<typeof TargetHealth> {
   static propsDefinition = {
@@ -48,43 +44,26 @@ class TargetHealth extends hz.Component<typeof TargetHealth> {
     headshotKillSfx: { type: hz.PropTypes.Entity },
 
     respawnDelay: { type: hz.PropTypes.Number, default: 2 },
+    // Teleport back to the spawn point on respawn, as NPCMonster does.
+    returnToStartOnRespawn: { type: hz.PropTypes.Boolean, default: true },
 
     // --- movement -------------------------------------------------------
     chaseEnabled: { type: hz.PropTypes.Boolean, default: true },
+    // Must match a baked profile in Systems > Navigation.
+    navProfileName: { type: hz.PropTypes.String, default: 'Zombie' },
+
     moveSpeed: { type: hz.PropTypes.Number, default: 1.5 }, // metres/second
+    // The agent decelerates into this distance and stops.
     stopDistance: { type: hz.PropTypes.Number, default: 2 },
+    // Reissuing the destination every frame is wasteful; interval in seconds.
+    repathInterval: { type: hz.PropTypes.Number, default: 0.25 },
 
-    faceThePlayer: { type: hz.PropTypes.Boolean, default: true },
-    // If the model faces sideways, correct it here (try 90/180/270).
-    facingOffsetDegrees: { type: hz.PropTypes.Number, default: 0 },
-
-    // Seconds to keep detouring the same way before reconsidering. Too low
-    // and he jitters against a flat wall.
-    sideCommitSeconds: { type: hz.PropTypes.Number, default: 1.2 },
-
-    // --- probes ---------------------------------------------------------
-    // The Raycast gizmo. Reusing the gun's is fine.
-    groundRaycast: { type: hz.PropTypes.Entity },
-    // How far ahead to look. Must clear his own body.
-    probeAhead: { type: hz.PropTypes.Number, default: 0.6 },
-    // Start the downward ray this far above him.
-    probeHeight: { type: hz.PropTypes.Number, default: 1.5 },
-    // How far below to keep looking before giving up.
-    maxDrop: { type: hz.PropTypes.Number, default: 5 },
-
-    // Horizontal wall ray starts this far out, to clear his own collider.
-    bodyRadius: { type: hz.PropTypes.Number, default: 0.5 },
-    // And reaches this much further.
-    wallProbeDistance: { type: hz.PropTypes.Number, default: 0.8 },
-    // Height above the root pivot to cast the wall ray from.
-    wallProbeHeight: { type: hz.PropTypes.Number, default: 0.3 },
-
-    // Ground rising more than this is a wall - refuse to step.
-    maxStepUp: { type: hz.PropTypes.Number, default: 0.5 },
-    // Ground falling more than this is a cliff - refuse to step.
-    maxStepDown: { type: hz.PropTypes.Number, default: 1 },
-    // Trim if he sinks into or floats above the ground.
-    groundOffset: { type: hz.PropTypes.Number, default: 0 },
+    /**
+     * Degrees of misalignment tolerated before the agent will walk forward.
+     * The default of 360 lets it slide off in any direction regardless of
+     * facing; 90 is what Meta's NPCAgent uses, and it turns convincingly.
+     */
+    requiredForwardAlignment: { type: hz.PropTypes.Number, default: 90 },
 
     debugMovement: { type: hz.PropTypes.Boolean, default: false },
   };
@@ -96,19 +75,13 @@ class TargetHealth extends hz.Component<typeof TargetHealth> {
   private fillFullScale: hz.Vec3 | null = null;
   private fillFullPosition: hz.Vec3 | null = null;
 
-  /**
-   * Height of this entity's origin above the ground, measured on the first
-   * successful probe. The root's pivot may sit at the waist rather than the
-   * feet, so we preserve whatever offset it was placed with.
-   */
-  private footOffset: number | null = null;
-
-  /** +1 or -1 once committed to detouring around one side; 0 when going straight. */
-  private preferredSide = 0;
-  private sideCommitCountdown = 0;
+  private agent: NavMeshAgent | null = null;
+  private startLocation: hz.Vec3 | null = null;
+  private repathCountdown = 0;
 
   start() {
     this.health = this.props.maxHealth;
+    this.startLocation = this.entity.position.get().clone();
 
     const fill = this.props.healthBarFill;
     if (fill) {
@@ -118,12 +91,7 @@ class TargetHealth extends hz.Component<typeof TargetHealth> {
       console.warn('TargetHealth: healthBarFill prop is not set.');
     }
 
-    if (!this.props.groundRaycast) {
-      console.warn(
-        'TargetHealth: groundRaycast prop is not set. The target will walk ' +
-          'at a fixed height and clip through terrain.',
-      );
-    }
+    this.setUpAgent();
 
     this.connectLocalEvent(this.entity, damageEvent, (data) => {
       this.takeDamage(data.amount, data.isHeadshot);
@@ -137,6 +105,19 @@ class TargetHealth extends hz.Component<typeof TargetHealth> {
     );
 
     this.refreshBar();
+  }
+
+  private setUpAgent() {
+    // as() returns a wrapper whether or not Navigation Locomotion is enabled,
+    // so this succeeding is not proof the editor side is set up.
+    const agent = this.entity.as(NavMeshAgent);
+    this.agent = agent;
+
+    agent.profileName.set(this.props.navProfileName);
+    agent.maxSpeed.set(this.props.moveSpeed);
+    agent.stoppingDistance.set(this.props.stopDistance);
+    agent.requiredForwardAlignment.set(this.props.requiredForwardAlignment);
+    agent.isImmobile.set(false);
   }
 
   // ---------------------------------------------------------------- health
@@ -173,12 +154,26 @@ class TargetHealth extends hz.Component<typeof TargetHealth> {
       console.log('TargetHealth: TARGET DOWN');
     }
 
+    // isImmobile plants the agent; clearing the destination drops its path.
+    this.agent?.isImmobile.set(true);
+    this.agent?.destination.set(null);
+
     this.async.setTimeout(() => {
-      this.health = this.props.maxHealth;
-      this.isDead = false;
-      this.refreshBar();
-      console.log('TargetHealth: target reset to full health');
+      this.respawn();
     }, this.props.respawnDelay * 1000);
+  }
+
+  private respawn() {
+    if (this.props.returnToStartOnRespawn && this.startLocation) {
+      this.entity.position.set(this.startLocation);
+    }
+
+    this.health = this.props.maxHealth;
+    this.isDead = false;
+    this.agent?.isImmobile.set(false);
+    this.refreshBar();
+
+    console.log('TargetHealth: target reset to full health');
   }
 
   private refreshBar() {
@@ -208,274 +203,32 @@ class TargetHealth extends hz.Component<typeof TargetHealth> {
   // -------------------------------------------------------------- movement
 
   private chaseTick(deltaTime: number) {
-    if (!this.props.chaseEnabled || this.isDead) {
+    const agent = this.agent;
+    if (!agent || !this.props.chaseEnabled || this.isDead) {
       return;
     }
 
-    const myPos = this.entity.position.get();
-    const player = this.nearestPlayerPosition(myPos);
+    this.repathCountdown -= deltaTime;
+    if (this.repathCountdown > 0) {
+      return;
+    }
+    this.repathCountdown = this.props.repathInterval;
+
+    const player = this.nearestPlayerPosition(this.entity.position.get());
     if (!player) {
       return;
     }
 
-    // Horizontal only - we never want it climbing towards a player's head.
-    const dx = player.x - myPos.x;
-    const dz = player.z - myPos.z;
-    const distance = Math.sqrt(dx * dx + dz * dz);
-    if (distance < 0.001) {
-      return;
+    // Raw player position, no snapping. See the class comment.
+    agent.destination.set(player);
+
+    if (this.props.debugMovement) {
+      console.log(
+        `TargetHealth: speed ${agent.currentSpeed.get().toFixed(2)} ` +
+          `remaining ${agent.remainingDistance.get().toFixed(2)} ` +
+          `waypoints ${agent.path.get().length}`,
+      );
     }
-
-    const toPlayerX = dx / distance;
-    const toPlayerZ = dz / distance;
-
-    if (distance <= this.props.stopDistance) {
-      // Arrived: face the player and stand still.
-      this.faceDirection(toPlayerX, toPlayerZ);
-      this.preferredSide = 0;
-      this.sideCommitCountdown = 0;
-      return;
-    }
-
-    const heading = this.chooseHeading(myPos, toPlayerX, toPlayerZ, deltaTime);
-
-    if (!heading) {
-      // Boxed in on every whisker. Keep facing the player so he still reads
-      // as hunting rather than idle.
-      this.faceDirection(toPlayerX, toPlayerZ);
-      if (this.props.debugMovement) {
-        console.log('TargetHealth: no walkable heading - fully blocked.');
-      }
-      return;
-    }
-
-    // Face where he walks, not where the player is, or detours look wrong.
-    this.faceDirection(heading.x, heading.z);
-
-    const step = Math.min(
-      this.props.moveSpeed * deltaTime,
-      distance - this.props.stopDistance,
-    );
-
-    const nextX = myPos.x + heading.x * step;
-    const nextZ = myPos.z + heading.z * step;
-
-    if (heading.groundY == null) {
-      // No ground reading: hold height rather than guess.
-      this.entity.position.set(new hz.Vec3(nextX, myPos.y, nextZ));
-      return;
-    }
-
-    if (this.footOffset == null) {
-      this.footOffset = myPos.y - heading.groundY;
-      if (this.props.debugMovement) {
-        console.log(
-          `TargetHealth: calibrated footOffset ${this.footOffset.toFixed(2)}m`,
-        );
-      }
-    }
-
-    const desiredY =
-      heading.groundY + this.footOffset + this.props.groundOffset;
-
-    this.entity.position.set(new hz.Vec3(nextX, desiredY, nextZ));
-  }
-
-  /**
-   * Tries the direct heading first, then fans out to either side, returning
-   * the first walkable one.
-   */
-  private chooseHeading(
-    from: hz.Vec3,
-    toPlayerX: number,
-    toPlayerZ: number,
-    deltaTime: number,
-  ): { x: number; z: number; groundY: number | null } | null {
-    this.sideCommitCountdown -= deltaTime;
-    if (this.sideCommitCountdown <= 0) {
-      this.preferredSide = 0;
-    }
-
-    for (const angle of this.buildAngles()) {
-      const heading = this.rotateHeading(toPlayerX, toPlayerZ, angle);
-      const probe = this.evaluateHeading(from, heading.x, heading.z);
-
-      if (!probe.walkable) {
-        continue;
-      }
-
-      if (angle === 0) {
-        // Direct route is clear again; drop any detour commitment.
-        this.preferredSide = 0;
-        this.sideCommitCountdown = 0;
-      } else {
-        this.preferredSide = angle > 0 ? 1 : -1;
-        this.sideCommitCountdown = this.props.sideCommitSeconds;
-
-        if (this.props.debugMovement) {
-          console.log(`TargetHealth: detouring ${angle} degrees off-target.`);
-        }
-      }
-
-      return { x: heading.x, z: heading.z, groundY: probe.groundY };
-    }
-
-    return null;
-  }
-
-  /**
-   * Straight ahead first, then paired angles outward. The committed side is
-   * offered before its mirror so he keeps rounding an obstacle the same way.
-   */
-  private buildAngles(): number[] {
-    const side = this.preferredSide === 0 ? 1 : this.preferredSide;
-    const angles: number[] = [0];
-
-    for (const magnitude of STEER_ANGLES) {
-      angles.push(magnitude * side);
-      angles.push(-magnitude * side);
-    }
-
-    return angles;
-  }
-
-  /** Rotates a horizontal unit heading about the Y axis. */
-  private rotateHeading(
-    x: number,
-    z: number,
-    degrees: number,
-  ): { x: number; z: number } {
-    const radians = (degrees * Math.PI) / 180;
-    const cos = Math.cos(radians);
-    const sin = Math.sin(radians);
-
-    return {
-      x: x * cos + z * sin,
-      z: -x * sin + z * cos,
-    };
-  }
-
-  private evaluateHeading(
-    from: hz.Vec3,
-    dirX: number,
-    dirZ: number,
-  ): { walkable: boolean; groundY: number | null } {
-    if (this.isWallAhead(from, dirX, dirZ)) {
-      return { walkable: false, groundY: null };
-    }
-
-    const groundY = this.probeGround(from, dirX, dirZ);
-
-    // No ground reading at all - let him walk and hold height. Refusing here
-    // would freeze him anywhere the probe cannot reach.
-    if (groundY == null) {
-      return { walkable: true, groundY: null };
-    }
-
-    // Until calibrated we have no baseline to compare a rise against.
-    if (this.footOffset == null) {
-      return { walkable: true, groundY };
-    }
-
-    const desiredY = groundY + this.footOffset + this.props.groundOffset;
-    const rise = desiredY - from.y;
-
-    if (rise > this.props.maxStepUp || rise < -this.props.maxStepDown) {
-      return { walkable: false, groundY };
-    }
-
-    return { walkable: true, groundY };
-  }
-
-  /**
-   * Casts down onto the ground a short way ahead.
-   *
-   * The probe starts ahead of and above him so it clears his own colliders;
-   * a ray starting inside his body would just hit his own hitboxes.
-   *
-   * @returns the ground height, or null if nothing was found.
-   */
-  private probeGround(
-    from: hz.Vec3,
-    dirX: number,
-    dirZ: number,
-  ): number | null {
-    const gizmo = this.props.groundRaycast?.as(hz.RaycastGizmo);
-    if (!gizmo) {
-      return null;
-    }
-
-    const origin = new hz.Vec3(
-      from.x + dirX * this.props.probeAhead,
-      from.y + this.props.probeHeight,
-      from.z + dirZ * this.props.probeAhead,
-    );
-
-    const hit = gizmo.raycast(origin, new hz.Vec3(0, -1, 0), {
-      layerType: hz.LayerType.Both,
-      maxDistance: this.props.probeHeight + this.props.maxDrop,
-    });
-
-    if (hit == null || this.isOwnHitbox(hit)) {
-      return null;
-    }
-
-    return hit.hitPoint.y;
-  }
-
-  /**
-   * Short horizontal ray at chest height. Catches walls standing on ground
-   * level, which the downward probe reads as perfectly walkable floor.
-   */
-  private isWallAhead(from: hz.Vec3, dirX: number, dirZ: number): boolean {
-    const gizmo = this.props.groundRaycast?.as(hz.RaycastGizmo);
-    if (!gizmo) {
-      return false;
-    }
-
-    // Start outside his own collider, or every ray hits himself.
-    const origin = new hz.Vec3(
-      from.x + dirX * this.props.bodyRadius,
-      from.y + this.props.wallProbeHeight,
-      from.z + dirZ * this.props.bodyRadius,
-    );
-
-    const hit = gizmo.raycast(origin, new hz.Vec3(dirX, 0, dirZ), {
-      layerType: hz.LayerType.Both,
-      maxDistance: this.props.wallProbeDistance,
-    });
-
-    if (hit == null) {
-      return false;
-    }
-
-    // Walking into the player is not an obstacle, it is the goal.
-    if (hit.targetType === hz.RaycastTargetType.Player) {
-      return false;
-    }
-
-    return !this.isOwnHitbox(hit);
-  }
-
-  /** True when a ray came back with one of our own tagged hitboxes. */
-  private isOwnHitbox(hit: hz.RaycastHit): boolean {
-    if (hit.targetType !== hz.RaycastTargetType.Entity) {
-      return false;
-    }
-
-    return (
-      hit.target.tags.contains('head') || hit.target.tags.contains('body')
-    );
-  }
-
-  private faceDirection(dirX: number, dirZ: number) {
-    if (!this.props.faceThePlayer) {
-      return;
-    }
-
-    const yaw =
-      (Math.atan2(dirX, dirZ) * 180) / Math.PI + this.props.facingOffsetDegrees;
-    this.entity.rotation.set(hz.Quaternion.fromEuler(new hz.Vec3(0, yaw, 0)));
   }
 
   private nearestPlayerPosition(from: hz.Vec3): hz.Vec3 | null {
