@@ -1,4 +1,5 @@
 import * as hz from 'horizon/core';
+import * as nav from 'horizon/navmesh';
 
 /**
  * Sent by the gun to whichever entity owns a TargetHealth component.
@@ -12,41 +13,43 @@ export const damageEvent = new hz.LocalEvent<{
 /**
  * TargetHealth
  * ------------
- * Attach to the EMPTY root object of a target ("Target"), which must be set
- * to Motion: Animated. Expects two collidable children tagged "head" and
- * "body", plus a health bar fill object.
+ * Attach to the EMPTY root object of a target ("Target"), Motion: Animated.
+ * Expects two collidable children tagged "head" and "body", plus a health
+ * bar fill object.
  *
- * Health and chasing live in one component because this editor build only
- * allows a single script per entity. That also makes death stop the walk
- * without needing an event between scripts.
+ * Movement has two modes:
+ *   navmesh  - hands a destination to a NavMeshAgent, which follows terrain
+ *              and paths around obstacles. Requires a baked navigation
+ *              profile and Navigation Locomotion enabled on this entity.
+ *   manual   - the old straight-line walk with height pinned to startY.
+ *              Kept as a fallback for when there is no agent.
  */
 class TargetHealth extends hz.Component<typeof TargetHealth> {
   static propsDefinition = {
     // --- health ---------------------------------------------------------
     maxHealth: { type: hz.PropTypes.Number, default: 100 },
 
-    // Coloured cube that shrinks. Sibling of the bar background, both
-    // parented to an unscaled empty so the local maths stays clean.
     healthBarFill: { type: hz.PropTypes.Entity },
-    // Optional Text gizmo showing "80 / 100".
     healthText: { type: hz.PropTypes.Entity },
 
-    // Plays on EVERY successful hit, head or body.
     hitMarkerSfx: { type: hz.PropTypes.Entity },
-    // Plays only when a headshot is the killing blow.
     headshotKillSfx: { type: hz.PropTypes.Entity },
 
-    // Seconds after death before the target resets to full health.
     respawnDelay: { type: hz.PropTypes.Number, default: 2 },
 
-    // --- chasing --------------------------------------------------------
+    // --- movement -------------------------------------------------------
     chaseEnabled: { type: hz.PropTypes.Boolean, default: true },
-    moveSpeed: { type: hz.PropTypes.Number, default: 1.5 }, // metres/second
+    // Untick to force the old straight-line movement.
+    useNavMesh: { type: hz.PropTypes.Boolean, default: true },
+
     // How close it gets before it stops walking.
     stopDistance: { type: hz.PropTypes.Number, default: 2 },
+    // Repathing every frame is wasteful; this is the interval in seconds.
+    repathInterval: { type: hz.PropTypes.Number, default: 0.25 },
 
+    // Manual-mode only. The agent handles its own speed and facing.
+    moveSpeed: { type: hz.PropTypes.Number, default: 1.5 },
     faceThePlayer: { type: hz.PropTypes.Boolean, default: true },
-    // If the model ends up facing sideways, correct it here (try 90/180/270).
     facingOffsetDegrees: { type: hz.PropTypes.Number, default: 0 },
   };
 
@@ -57,8 +60,11 @@ class TargetHealth extends hz.Component<typeof TargetHealth> {
   private fillFullScale: hz.Vec3 | null = null;
   private fillFullPosition: hz.Vec3 | null = null;
 
-  // Height is pinned here so the target cannot drift up or sink.
+  // Manual mode pins height here so the target cannot drift or sink.
   private startY = 0;
+
+  private agent: nav.NavMeshAgent | null = null;
+  private repathCountdown = 0;
 
   start() {
     this.health = this.props.maxHealth;
@@ -70,6 +76,16 @@ class TargetHealth extends hz.Component<typeof TargetHealth> {
       this.fillFullPosition = fill.transform.localPosition.get().clone();
     } else {
       console.warn('TargetHealth: healthBarFill prop is not set.');
+    }
+
+    this.agent = this.entity.as(nav.NavMeshAgent);
+    if (this.agent) {
+      console.log('TargetHealth: NavMeshAgent found - using pathfinding.');
+    } else {
+      console.warn(
+        'TargetHealth: no NavMeshAgent on this entity. Falling back to ' +
+          'straight-line movement. Check Navigation Locomotion is enabled.',
+      );
     }
 
     this.connectLocalEvent(this.entity, damageEvent, (data) => {
@@ -120,6 +136,8 @@ class TargetHealth extends hz.Component<typeof TargetHealth> {
       console.log('TargetHealth: TARGET DOWN');
     }
 
+    this.stopMoving();
+
     this.async.setTimeout(() => {
       this.health = this.props.maxHealth;
       this.isDead = false;
@@ -152,14 +170,51 @@ class TargetHealth extends hz.Component<typeof TargetHealth> {
     }
   }
 
-  // --------------------------------------------------------------- chasing
+  // -------------------------------------------------------------- movement
 
   private chaseTick(deltaTime: number) {
-    // Dead targets stand still until they respawn.
     if (!this.props.chaseEnabled || this.isDead) {
       return;
     }
 
+    if (this.props.useNavMesh && this.agent) {
+      this.navMeshTick(deltaTime);
+    } else {
+      this.manualTick(deltaTime);
+    }
+  }
+
+  /** Parking the destination on our own position is how an agent is told to stop. */
+  private stopMoving() {
+    this.agent?.destination.set(this.entity.position.get());
+  }
+
+  private navMeshTick(deltaTime: number) {
+    this.repathCountdown -= deltaTime;
+    if (this.repathCountdown > 0) {
+      return;
+    }
+    this.repathCountdown = this.props.repathInterval;
+
+    const myPos = this.entity.position.get();
+    const target = this.nearestPlayerPosition(myPos);
+    if (!target) {
+      return;
+    }
+
+    const dx = target.x - myPos.x;
+    const dz = target.z - myPos.z;
+    const distance = Math.sqrt(dx * dx + dz * dz);
+
+    if (distance <= this.props.stopDistance) {
+      this.stopMoving();
+      return;
+    }
+
+    this.agent?.destination.set(target);
+  }
+
+  private manualTick(deltaTime: number) {
     const myPos = this.entity.position.get();
     const target = this.nearestPlayerPosition(myPos);
     if (!target) {
