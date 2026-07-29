@@ -1,18 +1,27 @@
 import * as hz from 'horizon/core';
 import { damageEvent } from 'TargetHealth';
 
-/** Local axes of the muzzle we can fire along. */
-const AIM_AXES = ['forward', 'back', 'right', 'left', 'up', 'down'];
-
+/**
+ * SimpleGun
+ * ---------
+ * Attach to the grabbable gun root ("My Try").
+ *
+ * Primary action -> gunshot audio, raycast from Muzzle_point, impact particle
+ * at the hit point, and a damage event to whatever tagged hitbox was hit.
+ *
+ * NOTE: the Raycast gizmo's "Collide With" property must include Objects.
+ * Set to Players only, every hit comes back as static geometry and no
+ * entity is ever reported.
+ */
 class SimpleGun extends hz.Component<typeof SimpleGun> {
   static propsDefinition = {
     muzzle: { type: hz.PropTypes.Entity },
     gunshotSfx: { type: hz.PropTypes.Entity },
     raycastGizmo: { type: hz.PropTypes.Entity },
 
-    // Which local axis of Muzzle_point runs down the barrel.
-    // One of: forward, back, right, left, up, down
-    aimAxis: { type: hz.PropTypes.String, default: 'forward' },
+    // One permanent particle gizmo, repositioned per shot. Spawning copies
+    // per shot rendered unreliably, so a single reused emitter it is.
+    impactParticle: { type: hz.PropTypes.Entity },
 
     damagePerShot: { type: hz.PropTypes.Number, default: 25 },
     headshotMultiplier: { type: hz.PropTypes.Number, default: 2 },
@@ -20,9 +29,8 @@ class SimpleGun extends hz.Component<typeof SimpleGun> {
     fireCooldown: { type: hz.PropTypes.Number, default: 0.35 },
     maxRange: { type: hz.PropTypes.Number, default: 100 },
 
-    debug: { type: hz.PropTypes.Boolean, default: true },
-    // Diagnostic only: set this to the Target so the script can report which
-    // axis actually points at it.
+    debug: { type: hz.PropTypes.Boolean, default: false },
+    // Diagnostic only: reports how far off the muzzle is from the target.
     aimCheckTarget: { type: hz.PropTypes.Entity },
   };
 
@@ -61,10 +69,10 @@ class SimpleGun extends hz.Component<typeof SimpleGun> {
     }
 
     const origin = muzzle.position.get();
-    const direction = this.axisVector(muzzle, this.props.aimAxis);
+    const direction = muzzle.forward.get();
 
-    this.log(`fire along "${this.props.aimAxis}" dir ${direction.toString()}`);
-    this.logAllAxisErrors(muzzle, origin);
+    this.log(`fire from ${origin.toString()} dir ${direction.toString()}`);
+    this.logAimError(origin, direction);
 
     const hit = gizmo.raycast(origin, direction, {
       layerType: hz.LayerType.Both,
@@ -75,6 +83,8 @@ class SimpleGun extends hz.Component<typeof SimpleGun> {
       this.log('MISS - ray hit nothing at all');
       return;
     }
+
+    this.playImpact(hit.hitPoint, direction, muzzle.rotation.get());
 
     if (hit.targetType !== hz.RaycastTargetType.Entity) {
       this.log(
@@ -108,35 +118,37 @@ class SimpleGun extends hz.Component<typeof SimpleGun> {
     });
   }
 
-  /** World-space direction of one of the muzzle's local axes. */
-  private axisVector(muzzle: hz.Entity, axis: string): hz.Vec3 {
-    switch (axis) {
-      case 'back': {
-        const v = muzzle.forward.get();
-        return new hz.Vec3(-v.x, -v.y, -v.z);
-      }
-      case 'right':
-        return muzzle.right.get();
-      case 'left': {
-        const v = muzzle.right.get();
-        return new hz.Vec3(-v.x, -v.y, -v.z);
-      }
-      case 'up':
-        return muzzle.up.get();
-      case 'down': {
-        const v = muzzle.up.get();
-        return new hz.Vec3(-v.x, -v.y, -v.z);
-      }
-      default:
-        return muzzle.forward.get();
+  /** Reposition the shared emitter just off the surface, then fire it. */
+  private playImpact(
+    hitPoint: hz.Vec3,
+    direction: hz.Vec3,
+    rotation: hz.Quaternion,
+  ) {
+    const impact = this.props.impactParticle;
+    if (!impact) {
+      this.log('impactParticle is not assigned.');
+      return;
     }
+
+    // Pull back along the ray so the effect is not buried inside the surface.
+    const visiblePosition = new hz.Vec3(
+      hitPoint.x - direction.x * 0.08,
+      hitPoint.y - direction.y * 0.08,
+      hitPoint.z - direction.z * 0.08,
+    );
+
+    impact.position.set(visiblePosition);
+    impact.rotation.set(rotation);
+
+    // Let the new transform land before playback, or the burst renders at the
+    // emitter's previous position.
+    this.async.setTimeout(() => {
+      impact.as(hz.ParticleGizmo)?.play();
+    }, 100);
   }
 
-  /**
-   * Diagnostic: report how far each of the six local axes is from pointing at
-   * the target. The smallest angle names the axis to put in aimAxis.
-   */
-  private logAllAxisErrors(muzzle: hz.Entity, origin: hz.Vec3) {
+  /** Diagnostic: angle between the muzzle's forward axis and the target. */
+  private logAimError(origin: hz.Vec3, direction: hz.Vec3) {
     const check = this.props.aimCheckTarget;
     if (!check || !this.props.debug) {
       return;
@@ -152,14 +164,14 @@ class SimpleGun extends hz.Component<typeof SimpleGun> {
       return;
     }
 
-    this.log(`  aim check - target is ${distance.toFixed(2)}m away`);
+    const dot =
+      (direction.x * dx + direction.y * dy + direction.z * dz) / distance;
+    const angle = (Math.acos(Math.max(-1, Math.min(1, dot))) * 180) / Math.PI;
 
-    for (const axis of AIM_AXES) {
-      const v = this.axisVector(muzzle, axis);
-      const dot = (v.x * dx + v.y * dy + v.z * dz) / distance;
-      const angle = (Math.acos(Math.max(-1, Math.min(1, dot))) * 180) / Math.PI;
-      this.log(`    ${axis}: ${angle.toFixed(1)} degrees off`);
-    }
+    this.log(
+      `aim check: target ${distance.toFixed(2)}m away, muzzle is ` +
+        `${angle.toFixed(1)} degrees off from pointing at it`,
+    );
   }
 
   /**
@@ -177,7 +189,7 @@ class SimpleGun extends hz.Component<typeof SimpleGun> {
       const isBody = current.tags.contains('body');
 
       if (isHead || isBody) {
-        this.log(`  tag "${isHead ? 'head' : 'body'}" on "${current.name.get()}"`);
+        this.log(`tag "${isHead ? 'head' : 'body'}" on "${current.name.get()}"`);
 
         const owner = current.parent.get();
         if (!owner) {
@@ -189,7 +201,7 @@ class SimpleGun extends hz.Component<typeof SimpleGun> {
         return { owner, isHead };
       }
 
-      this.log(`  no tag on "${current.name.get()}", checking its parent`);
+      this.log(`no tag on "${current.name.get()}", checking its parent`);
       current = current.parent.get();
     }
 
