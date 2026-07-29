@@ -15,6 +15,9 @@ class SimpleGun extends hz.Component<typeof SimpleGun> {
 
     // Set false once everything works to quieten the console.
     debug: { type: hz.PropTypes.Boolean, default: true },
+    // Diagnostic only: point this at the Target to measure how far the
+    // muzzle's forward axis is from actually aiming at it.
+    aimCheckTarget: { type: hz.PropTypes.Entity },
   };
 
   private lastFireTime = 0;
@@ -54,6 +57,7 @@ class SimpleGun extends hz.Component<typeof SimpleGun> {
     const origin = muzzle.position.get();
     const direction = muzzle.forward.get();
     this.log(`fire from ${origin.toString()} dir ${direction.toString()}`);
+    this.logAimError(origin, direction);
 
     const hit = gizmo.raycast(origin, direction, {
       layerType: hz.LayerType.Both,
@@ -97,6 +101,39 @@ class SimpleGun extends hz.Component<typeof SimpleGun> {
       amount,
       isHeadshot: found.isHead,
     });
+  }
+
+  /**
+   * Diagnostic: compare the muzzle's forward axis against the direction the
+   * target actually lies in. Near 0 degrees means the muzzle is aimed
+   * correctly; a large angle means Muzzle_point needs rotating.
+   * Written with plain component maths to avoid depending on Vec3 helper
+   * semantics.
+   */
+  private logAimError(origin: hz.Vec3, direction: hz.Vec3) {
+    const check = this.props.aimCheckTarget;
+    if (!check || !this.props.debug) {
+      return;
+    }
+
+    const targetPos = check.position.get();
+    const dx = targetPos.x - origin.x;
+    const dy = targetPos.y - origin.y;
+    const dz = targetPos.z - origin.z;
+
+    const distance = Math.sqrt(dx * dx + dy * dy + dz * dz);
+    if (distance < 0.001) {
+      return;
+    }
+
+    const dot =
+      (direction.x * dx + direction.y * dy + direction.z * dz) / distance;
+    const angle = (Math.acos(Math.max(-1, Math.min(1, dot))) * 180) / Math.PI;
+
+    this.log(
+      `  aim check: target ${distance.toFixed(2)}m away, muzzle is ` +
+        `${angle.toFixed(1)} degrees off from pointing at it`,
+    );
   }
 
   /**
