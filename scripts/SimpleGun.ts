@@ -66,7 +66,12 @@ class SimpleGun extends hz.Component<typeof SimpleGun> {
     }
 
     if (hit.targetType !== hz.RaycastTargetType.Entity) {
-      this.log(`hit a non-entity, targetType=${hit.targetType}`);
+      // targetType 2 is static world geometry. Logging where it landed tells
+      // us whether we clipped a wall or hit a hitbox left on Motion: None.
+      this.log(
+        `hit a non-entity (targetType=${hit.targetType}) at ` +
+          `${hit.hitPoint.toString()}, ${hit.distance.toFixed(2)}m away`,
+      );
       return;
     }
 
