@@ -194,6 +194,49 @@ class TargetHealth extends hz.Component<typeof TargetHealth> {
         ? 'TargetHealth: pooled zombie waiting for a round.'
         : 'TargetHealth: standalone enemy ready.',
     );
+
+    if (!roundManaged) {
+      this.suggestFootHeight();
+    }
+  }
+
+  /**
+   * Calibration aid for a hand-placed enemy. Stand him on the ground in the
+   * editor exactly how he should look, Preview once, and this prints the
+   * footHeight that reproduces that pose everywhere else.
+   *
+   * The probe is offset sideways by bodyRadius so it clears his own collider -
+   * a ray starting inside the body just hits the body.
+   */
+  private suggestFootHeight() {
+    const gizmo = this.ownGroundRaycast?.as(hz.RaycastGizmo);
+    if (!gizmo) {
+      return;
+    }
+
+    const here = this.entity.position.get();
+
+    const hit = gizmo.raycast(
+      new hz.Vec3(here.x + this.props.bodyRadius, here.y + 2, here.z),
+      new hz.Vec3(0, -1, 0),
+      { layerType: hz.LayerType.Both, maxDistance: 60 },
+    );
+
+    if (hit == null || this.isHitbox(hit)) {
+      console.log(
+        'TargetHealth: CALIBRATION - no ground found beneath me, cannot ' +
+          'suggest a footHeight. Stand me on solid ground and retry.',
+      );
+      return;
+    }
+
+    const suggested = here.y - hit.hitPoint.y;
+
+    console.log(
+      `TargetHealth: CALIBRATION - I am at Y ${here.y.toFixed(2)}, ground is ` +
+        `at ${hit.hitPoint.y.toFixed(2)} -> set footHeight to ` +
+        `${suggested.toFixed(2)} (currently ${this.props.footHeight})`,
+    );
   }
 
   // ----------------------------------------------------------- own children
