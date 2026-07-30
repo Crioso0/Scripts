@@ -48,7 +48,7 @@ class ScoreHud extends UIComponent<typeof ScoreHud> {
     });
   }
 
-  start() {
+  preStart() {
     this.connectCodeBlockEvent(
       this.entity,
       hz.CodeBlockEvents.OnPlayerEnterWorld,

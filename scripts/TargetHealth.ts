@@ -1,6 +1,11 @@
 import * as hz from 'horizon/core';
 import { playerDamageEvent } from 'PlayerHealth';
-import { awardMoneyEvent, damageEvent } from 'GameEvents';
+import {
+  activateZombieEvent,
+  awardMoneyEvent,
+  damageEvent,
+  zombieDefeatedEvent,
+} from 'GameEvents';
 
 /** Whisker angles tried in order, smallest deviation first. */
 const STEER_ANGLES = [30, 60, 90, 120, 150];
@@ -10,26 +15,31 @@ const STEER_ANGLES = [30, 60, 90, 120, 150];
  * ------------
  * Enemy health, rewards, locomotion and melee attack.
  *
- * damageEvent comes from GameEvents rather than being declared here. Horizon
- * matches local events by object identity, not by name, so a second
- * `new LocalEvent('damage')` in this file would be a different event from the
- * one SimpleGun sends and no damage would ever arrive.
+ * IMPORTANT: this component resolves its own body, head and health bar by
+ * walking its own descendants at runtime rather than trusting the editor
+ * props. Copies produced by world.spawnAsset() do not reliably rewire entity
+ * props to the new instance's children, so prop-based references had every
+ * pooled zombie manipulating the ORIGINAL template's mesh - which read as the
+ * original enemy going invisible while still chasing and attacking.
+ *
+ * The props are kept as a fallback for a hand-placed enemy whose children are
+ * not tagged.
  */
 class TargetHealth extends hz.Component<typeof TargetHealth> {
   static propsDefinition = {
     maxHealth: { type: hz.PropTypes.Number, default: 100 },
 
+    // Fallbacks only. Runtime resolution by tag/name wins when it succeeds.
     healthBarFill: { type: hz.PropTypes.Entity },
     healthText: { type: hz.PropTypes.Entity },
     healthBarRoot: { type: hz.PropTypes.Entity },
+    enemyVisual: { type: hz.PropTypes.Entity },
+    bodyHitbox: { type: hz.PropTypes.Entity },
+    headHitbox: { type: hz.PropTypes.Entity },
 
     hitMarkerSfx: { type: hz.PropTypes.Entity },
     headshotKillSfx: { type: hz.PropTypes.Entity },
     deathSfx: { type: hz.PropTypes.Entity },
-
-    enemyVisual: { type: hz.PropTypes.Entity },
-    bodyHitbox: { type: hz.PropTypes.Entity },
-    headHitbox: { type: hz.PropTypes.Entity },
 
     hideOnDeath: { type: hz.PropTypes.Boolean, default: true },
     respawnDelay: { type: hz.PropTypes.Number, default: 3 },
@@ -39,10 +49,14 @@ class TargetHealth extends hz.Component<typeof TargetHealth> {
 
     attackDamage: { type: hz.PropTypes.Number, default: 20 },
     attackRange: { type: hz.PropTypes.Number, default: 2.1 },
+    /**
+     * Maximum height difference for a melee hit to land. Without this, the
+     * horizontal-only chase distance let zombies punch through floors and
+     * ceilings from many metres above or below the player.
+     */
+    attackVerticalRange: { type: hz.PropTypes.Number, default: 2.5 },
     attackCooldown: { type: hz.PropTypes.Number, default: 1 },
 
-    // --- rewards --------------------------------------------------------
-    // Call of Duty Zombies pays per hit, then a bonus on the kill.
     moneyPerHit: { type: hz.PropTypes.Number, default: 10 },
     moneyPerKill: { type: hz.PropTypes.Number, default: 50 },
     moneyPerHeadshotKill: { type: hz.PropTypes.Number, default: 100 },
@@ -55,6 +69,13 @@ class TargetHealth extends hz.Component<typeof TargetHealth> {
     facingOffsetDegrees: { type: hz.PropTypes.Number, default: 0 },
 
     sideCommitSeconds: { type: hz.PropTypes.Number, default: 1.2 },
+    /**
+     * Seconds of being fully blocked before shoving forward anyway. Stops a
+     * zombie spawned inside geometry from freezing there permanently.
+     */
+    unstickAfterSeconds: { type: hz.PropTypes.Number, default: 2 },
+    /** Seconds between heading re-evaluations. Each one costs up to 22 rays. */
+    steerInterval: { type: hz.PropTypes.Number, default: 0.2 },
 
     groundRaycast: { type: hz.PropTypes.Entity },
     probeAhead: { type: hz.PropTypes.Number, default: 0.6 },
@@ -70,10 +91,14 @@ class TargetHealth extends hz.Component<typeof TargetHealth> {
     groundOffset: { type: hz.PropTypes.Number, default: 0 },
 
     debugMovement: { type: hz.PropTypes.Boolean, default: false },
+
+    roundManaged: { type: hz.PropTypes.Boolean, default: false },
   };
 
   private health = 0;
   private isDead = false;
+  private isActive = true;
+
   private lastAttackTime = 0;
 
   private fillFullScale: hz.Vec3 | null = null;
@@ -87,9 +112,33 @@ class TargetHealth extends hz.Component<typeof TargetHealth> {
   private preferredSide = 0;
   private sideCommitCountdown = 0;
 
+  // Resolved from our own descendants at start.
+  private ownBody: hz.Entity | null = null;
+  private ownHead: hz.Entity | null = null;
+  private ownBarRoot: hz.Entity | null = null;
+  private ownBarFill: hz.Entity | null = null;
+
+  private blockedSeconds = 0;
+  private steerCountdown = 0;
+  private cachedHeading: {
+    x: number;
+    z: number;
+    groundY: number | null;
+  } | null = null;
+
+  private runtimePlayerHealthManager: hz.Entity | null = null;
+
   preStart() {
     this.connectLocalEvent(this.entity, damageEvent, (data) => {
       this.takeDamage(data.attacker, data.amount, data.isHeadshot);
+    });
+
+    this.connectLocalEvent(this.entity, activateZombieEvent, (data) => {
+      this.activateForRound(
+        data.position,
+        data.rotation,
+        data.playerHealthManager,
+      );
     });
 
     this.connectLocalBroadcastEvent(
@@ -106,32 +155,126 @@ class TargetHealth extends hz.Component<typeof TargetHealth> {
     this.spawnPosition = this.entity.position.get().clone();
     this.spawnRotation = this.entity.rotation.get().clone();
 
-    const fill = this.props.healthBarFill;
+    this.resolveOwnParts();
+
+    const fill = this.ownBarFill;
     if (fill) {
       this.fillFullScale = fill.transform.localScale.get().clone();
       this.fillFullPosition = fill.transform.localPosition.get().clone();
     } else {
-      console.warn('TargetHealth: healthBarFill prop is not set.');
+      console.warn('TargetHealth: could not resolve a health bar fill.');
     }
 
     if (!this.props.groundRaycast) {
-      console.warn(
-        'TargetHealth: groundRaycast prop is not set. The target will walk ' +
-          'at a fixed height and may clip through terrain.',
-      );
+      console.warn('TargetHealth: groundRaycast is not assigned.');
     }
 
-    if (!this.props.playerHealthManager) {
-      console.warn(
-        'TargetHealth: playerHealthManager is not assigned. ' +
-          'The enemy cannot damage the player.',
+    const roundManaged = this.props.roundManaged;
+
+    this.isDead = false;
+    this.isActive = !roundManaged;
+
+    this.setEnemyAlive(this.isActive);
+    this.refreshBar();
+
+    console.log(
+      roundManaged
+        ? 'TargetHealth: pooled zombie waiting for a round.'
+        : 'TargetHealth: standalone enemy ready.',
+    );
+  }
+
+  // ----------------------------------------------------------- own children
+
+  /**
+   * Finds this instance's own body, head and health bar. Tags identify the
+   * hitboxes; names identify the bar. Props are only consulted when a part
+   * cannot be found among our descendants.
+   */
+  private resolveOwnParts() {
+    const descendants = this.collectDescendants(this.entity, 3);
+
+    for (const entity of descendants) {
+      const name = entity.name.get();
+
+      if (!this.ownBody && entity.tags.contains('body')) {
+        this.ownBody = entity;
+      } else if (!this.ownHead && entity.tags.contains('head')) {
+        this.ownHead = entity;
+      }
+
+      if (!this.ownBarFill && name.indexOf('Bar_Fill') >= 0) {
+        this.ownBarFill = entity;
+      } else if (!this.ownBarRoot && name.indexOf('HealthBar') >= 0) {
+        this.ownBarRoot = entity;
+      }
+    }
+
+    this.ownBody = this.ownBody ?? this.props.bodyHitbox ?? null;
+    this.ownHead = this.ownHead ?? this.props.headHitbox ?? null;
+    this.ownBarRoot = this.ownBarRoot ?? this.props.healthBarRoot ?? null;
+    this.ownBarFill = this.ownBarFill ?? this.props.healthBarFill ?? null;
+
+    if (this.props.debugMovement) {
+      console.log(
+        `TargetHealth: resolved parts body=${this.ownBody?.name.get() ?? 'none'} ` +
+          `head=${this.ownHead?.name.get() ?? 'none'} ` +
+          `barRoot=${this.ownBarRoot?.name.get() ?? 'none'} ` +
+          `barFill=${this.ownBarFill?.name.get() ?? 'none'}`,
       );
     }
+  }
+
+  private collectDescendants(root: hz.Entity, depth: number): hz.Entity[] {
+    if (depth <= 0) {
+      return [];
+    }
+
+    const found: hz.Entity[] = [];
+    const children = root.children.get();
+
+    for (const child of children) {
+      found.push(child);
+
+      for (const nested of this.collectDescendants(child, depth - 1)) {
+        found.push(nested);
+      }
+    }
+
+    return found;
+  }
+
+  private activateForRound(
+    position: hz.Vec3,
+    rotation: hz.Quaternion,
+    playerHealthManager: hz.Entity,
+  ) {
+    if (!this.props.roundManaged) {
+      return;
+    }
+
+    this.runtimePlayerHealthManager = playerHealthManager;
+
+    this.health = Math.max(1, this.props.maxHealth);
+
+    this.footOffset = null;
+    this.preferredSide = 0;
+    this.sideCommitCountdown = 0;
+    this.lastAttackTime = 0;
+    this.blockedSeconds = 0;
+    this.steerCountdown = 0;
+    this.cachedHeading = null;
+
+    this.entity.position.set(position);
+    this.entity.rotation.set(rotation);
+
+    this.isDead = false;
+    this.isActive = true;
 
     this.setEnemyAlive(true);
     this.refreshBar();
 
-    console.log('TargetHealth: enemy health and attack system ready');
+    console.log(`TargetHealth: zombie activated at ${position.toString()}`);
   }
 
   // ---------------------------------------------------------------- health
@@ -141,16 +284,21 @@ class TargetHealth extends hz.Component<typeof TargetHealth> {
     amount: number,
     isHeadshot: boolean,
   ) {
-    if (this.isDead) {
+    if (this.isDead || !this.isActive) {
+      return;
+    }
+
+    const actualDamage = Math.max(0, amount);
+    if (actualDamage <= 0) {
       return;
     }
 
     this.props.hitMarkerSfx?.as(hz.AudioGizmo)?.play();
 
-    this.health = Math.max(0, this.health - Math.max(0, amount));
+    this.health = Math.max(0, this.health - actualDamage);
 
     console.log(
-      `TargetHealth: ${isHeadshot ? 'head' : 'body'} for ${amount} -> ` +
+      `TargetHealth: ${isHeadshot ? 'head' : 'body'} for ${actualDamage} -> ` +
         `${this.health}/${this.props.maxHealth}`,
     );
 
@@ -169,6 +317,8 @@ class TargetHealth extends hz.Component<typeof TargetHealth> {
     }
 
     this.isDead = true;
+    this.isActive = false;
+
     this.setEnemyAlive(false);
 
     if (killedByHeadshot) {
@@ -181,30 +331,51 @@ class TargetHealth extends hz.Component<typeof TargetHealth> {
       this.pay(killer, this.props.moneyPerKill, 'kill');
     }
 
+    if (this.props.roundManaged) {
+      // Small delay so the death audio starts before the manager reuses us.
+      this.async.setTimeout(() => {
+        this.sendLocalBroadcastEvent(zombieDefeatedEvent, {
+          zombie: this.entity,
+          killer,
+        });
+      }, 100);
+
+      return;
+    }
+
     this.async.setTimeout(() => {
-      this.health = Math.max(1, this.props.maxHealth);
-      this.footOffset = null;
-      this.preferredSide = 0;
-      this.sideCommitCountdown = 0;
-      this.lastAttackTime = 0;
-
-      if (this.spawnPosition) {
-        this.entity.position.set(this.spawnPosition);
-      }
-
-      if (this.spawnRotation) {
-        this.entity.rotation.set(this.spawnRotation);
-      }
-
-      this.isDead = false;
-      this.setEnemyAlive(true);
-      this.refreshBar();
-
-      console.log('TargetHealth: target respawned with full health');
+      this.resetStandaloneEnemy();
     }, this.props.respawnDelay * 1000);
   }
 
-  /** Broadcast so ScoreHud - or anything else keeping score - can react. */
+  private resetStandaloneEnemy() {
+    this.health = Math.max(1, this.props.maxHealth);
+
+    this.footOffset = null;
+    this.preferredSide = 0;
+    this.sideCommitCountdown = 0;
+    this.lastAttackTime = 0;
+    this.blockedSeconds = 0;
+    this.steerCountdown = 0;
+    this.cachedHeading = null;
+
+    if (this.spawnPosition) {
+      this.entity.position.set(this.spawnPosition);
+    }
+
+    if (this.spawnRotation) {
+      this.entity.rotation.set(this.spawnRotation);
+    }
+
+    this.isDead = false;
+    this.isActive = true;
+
+    this.setEnemyAlive(true);
+    this.refreshBar();
+
+    console.log('TargetHealth: standalone target respawned.');
+  }
+
   private pay(player: hz.Player, amount: number, reason: string) {
     if (amount <= 0) {
       return;
@@ -215,20 +386,21 @@ class TargetHealth extends hz.Component<typeof TargetHealth> {
 
   private setEnemyAlive(alive: boolean) {
     if (this.props.hideOnDeath) {
-      this.props.enemyVisual?.visible.set(alive);
+      this.ownBody?.visible.set(alive);
+      this.ownHead?.visible.set(alive);
     }
 
-    this.props.healthBarRoot?.visible.set(alive);
+    this.ownBarRoot?.visible.set(alive);
 
-    this.props.bodyHitbox?.collidable.set(alive);
-    this.props.headHitbox?.collidable.set(alive);
+    this.ownBody?.collidable.set(alive);
+    this.ownHead?.collidable.set(alive);
   }
 
   private refreshBar() {
     const maxHealth = Math.max(1, this.props.maxHealth);
     const fraction = Math.max(0, Math.min(1, this.health / maxHealth));
 
-    const fill = this.props.healthBarFill;
+    const fill = this.ownBarFill;
 
     if (fill && this.fillFullScale && this.fillFullPosition) {
       const scale = this.fillFullScale.clone();
@@ -237,31 +409,25 @@ class TargetHealth extends hz.Component<typeof TargetHealth> {
 
       const position = this.fillFullPosition.clone();
       position.x =
-        this.fillFullPosition.x -
-        (this.fillFullScale.x * (1 - fraction)) / 2;
-
+        this.fillFullPosition.x - (this.fillFullScale.x * (1 - fraction)) / 2;
       fill.transform.localPosition.set(position);
     }
 
     const text = this.props.healthText;
-
     if (text) {
-      text
-        .as(hz.TextGizmo)
-        ?.text.set(`${this.health} / ${maxHealth}`);
+      text.as(hz.TextGizmo)?.text.set(`${this.health} / ${maxHealth}`);
     }
   }
 
   // -------------------------------------------------------------- movement
 
   private chaseTick(deltaTime: number) {
-    if (!this.props.chaseEnabled || this.isDead) {
+    if (!this.props.chaseEnabled || this.isDead || !this.isActive) {
       return;
     }
 
     const myPos = this.entity.position.get();
     const player = this.nearestPlayer(myPos);
-
     if (!player) {
       return;
     }
@@ -269,26 +435,29 @@ class TargetHealth extends hz.Component<typeof TargetHealth> {
     const playerPos = player.position.get();
 
     const dx = playerPos.x - myPos.x;
+    const dy = playerPos.y - myPos.y;
     const dz = playerPos.z - myPos.z;
-    const distance = Math.sqrt(dx * dx + dz * dz);
 
-    if (distance < 0.001) {
+    // Horizontal for steering; full 3D for deciding whether we can reach.
+    const flatDistance = Math.sqrt(dx * dx + dz * dz);
+    if (flatDistance < 0.001) {
       return;
     }
 
-    const toPlayerX = dx / distance;
-    const toPlayerZ = dz / distance;
+    const toPlayerX = dx / flatDistance;
+    const toPlayerZ = dz / flatDistance;
 
-    this.tryAttack(player, distance);
+    this.tryAttack(player, flatDistance, dy);
 
-    if (distance <= this.props.stopDistance) {
+    if (flatDistance <= this.props.stopDistance) {
       this.faceDirection(toPlayerX, toPlayerZ);
       this.preferredSide = 0;
       this.sideCommitCountdown = 0;
+      this.blockedSeconds = 0;
       return;
     }
 
-    const heading = this.chooseHeading(
+    const heading = this.currentHeading(
       myPos,
       toPlayerX,
       toPlayerZ,
@@ -297,19 +466,42 @@ class TargetHealth extends hz.Component<typeof TargetHealth> {
 
     if (!heading) {
       this.faceDirection(toPlayerX, toPlayerZ);
+      this.blockedSeconds += deltaTime;
 
-      if (this.props.debugMovement) {
-        console.log('TargetHealth: no walkable heading - fully blocked.');
+      if (this.blockedSeconds < this.props.unstickAfterSeconds) {
+        if (this.props.debugMovement) {
+          console.log(
+            `TargetHealth: blocked at ${myPos.toString()} ` +
+              `(${this.blockedSeconds.toFixed(1)}s)`,
+          );
+        }
+        return;
       }
 
+      // Fully boxed in for too long - shove straight at the player rather
+      // than stand still forever. A zombie spawned inside geometry would
+      // otherwise never move again.
+      if (this.props.debugMovement) {
+        console.log('TargetHealth: unsticking - forcing a step forward.');
+      }
+
+      const forcedStep = this.props.moveSpeed * deltaTime;
+      this.entity.position.set(
+        new hz.Vec3(
+          myPos.x + toPlayerX * forcedStep,
+          myPos.y,
+          myPos.z + toPlayerZ * forcedStep,
+        ),
+      );
       return;
     }
 
+    this.blockedSeconds = 0;
     this.faceDirection(heading.x, heading.z);
 
     const step = Math.min(
       this.props.moveSpeed * deltaTime,
-      distance - this.props.stopDistance,
+      flatDistance - this.props.stopDistance,
     );
 
     const nextX = myPos.x + heading.x * step;
@@ -322,13 +514,6 @@ class TargetHealth extends hz.Component<typeof TargetHealth> {
 
     if (this.footOffset == null) {
       this.footOffset = myPos.y - heading.groundY;
-
-      if (this.props.debugMovement) {
-        console.log(
-          `TargetHealth: calibrated footOffset ` +
-            `${this.footOffset.toFixed(2)}m`,
-        );
-      }
     }
 
     const desiredY =
@@ -337,26 +522,60 @@ class TargetHealth extends hz.Component<typeof TargetHealth> {
     this.entity.position.set(new hz.Vec3(nextX, desiredY, nextZ));
   }
 
-  private tryAttack(player: hz.Player, distance: number) {
-    if (distance > this.props.attackRange) {
+  /**
+   * Re-evaluates the heading on an interval and reuses it in between. Each
+   * evaluation is up to 22 raycasts, which at 60fps across a full wave of
+   * zombies is far more than the behaviour needs.
+   */
+  private currentHeading(
+    from: hz.Vec3,
+    toPlayerX: number,
+    toPlayerZ: number,
+    deltaTime: number,
+  ): { x: number; z: number; groundY: number | null } | null {
+    this.steerCountdown -= deltaTime;
+
+    if (this.steerCountdown > 0 && this.cachedHeading) {
+      return this.cachedHeading;
+    }
+
+    this.steerCountdown = this.props.steerInterval;
+    this.cachedHeading = this.chooseHeading(
+      from,
+      toPlayerX,
+      toPlayerZ,
+      deltaTime,
+    );
+
+    return this.cachedHeading;
+  }
+
+  private tryAttack(
+    player: hz.Player,
+    flatDistance: number,
+    heightDifference: number,
+  ) {
+    if (flatDistance > this.props.attackRange) {
+      return;
+    }
+
+    // Reject swings through floors and ceilings.
+    if (Math.abs(heightDifference) > this.props.attackVerticalRange) {
       return;
     }
 
     const now = Date.now();
-
     if (now - this.lastAttackTime < this.props.attackCooldown * 1000) {
       return;
     }
 
     this.lastAttackTime = now;
 
-    const manager = this.props.playerHealthManager;
+    const manager =
+      this.runtimePlayerHealthManager ?? this.props.playerHealthManager;
 
     if (!manager) {
-      console.warn(
-        'TargetHealth: enemy tried to attack, but ' +
-          'playerHealthManager is not assigned.',
-      );
+      console.warn('TargetHealth: no player health manager.');
       return;
     }
 
@@ -369,7 +588,7 @@ class TargetHealth extends hz.Component<typeof TargetHealth> {
 
     console.log(
       `TargetHealth: attacked "${player.name.get()}" for ` +
-        `${this.props.attackDamage} damage`,
+        `${this.props.attackDamage}`,
     );
   }
 
@@ -399,19 +618,9 @@ class TargetHealth extends hz.Component<typeof TargetHealth> {
       } else {
         this.preferredSide = angle > 0 ? 1 : -1;
         this.sideCommitCountdown = this.props.sideCommitSeconds;
-
-        if (this.props.debugMovement) {
-          console.log(
-            `TargetHealth: detouring ${angle} degrees off-target.`,
-          );
-        }
       }
 
-      return {
-        x: heading.x,
-        z: heading.z,
-        groundY: probe.groundY,
-      };
+      return { x: heading.x, z: heading.z, groundY: probe.groundY };
     }
 
     return null;
@@ -450,47 +659,27 @@ class TargetHealth extends hz.Component<typeof TargetHealth> {
     dirZ: number,
   ): { walkable: boolean; groundY: number | null } {
     if (this.isWallAhead(from, dirX, dirZ)) {
-      return {
-        walkable: false,
-        groundY: null,
-      };
+      return { walkable: false, groundY: null };
     }
 
     const groundY = this.probeGround(from, dirX, dirZ);
 
     if (groundY == null) {
-      return {
-        walkable: true,
-        groundY: null,
-      };
+      return { walkable: true, groundY: null };
     }
 
     if (this.footOffset == null) {
-      return {
-        walkable: true,
-        groundY,
-      };
+      return { walkable: true, groundY };
     }
 
-    const desiredY =
-      groundY + this.footOffset + this.props.groundOffset;
-
+    const desiredY = groundY + this.footOffset + this.props.groundOffset;
     const rise = desiredY - from.y;
 
-    if (
-      rise > this.props.maxStepUp ||
-      rise < -this.props.maxStepDown
-    ) {
-      return {
-        walkable: false,
-        groundY,
-      };
+    if (rise > this.props.maxStepUp || rise < -this.props.maxStepDown) {
+      return { walkable: false, groundY };
     }
 
-    return {
-      walkable: true,
-      groundY,
-    };
+    return { walkable: true, groundY };
   }
 
   private probeGround(
@@ -499,7 +688,6 @@ class TargetHealth extends hz.Component<typeof TargetHealth> {
     dirZ: number,
   ): number | null {
     const gizmo = this.props.groundRaycast?.as(hz.RaycastGizmo);
-
     if (!gizmo) {
       return null;
     }
@@ -515,20 +703,15 @@ class TargetHealth extends hz.Component<typeof TargetHealth> {
       maxDistance: this.props.probeHeight + this.props.maxDrop,
     });
 
-    if (hit == null || this.isOwnHitbox(hit)) {
+    if (hit == null || this.isHitbox(hit)) {
       return null;
     }
 
     return hit.hitPoint.y;
   }
 
-  private isWallAhead(
-    from: hz.Vec3,
-    dirX: number,
-    dirZ: number,
-  ): boolean {
+  private isWallAhead(from: hz.Vec3, dirX: number, dirZ: number): boolean {
     const gizmo = this.props.groundRaycast?.as(hz.RaycastGizmo);
-
     if (!gizmo) {
       return false;
     }
@@ -539,14 +722,10 @@ class TargetHealth extends hz.Component<typeof TargetHealth> {
       from.z + dirZ * this.props.bodyRadius,
     );
 
-    const hit = gizmo.raycast(
-      origin,
-      new hz.Vec3(dirX, 0, dirZ),
-      {
-        layerType: hz.LayerType.Both,
-        maxDistance: this.props.wallProbeDistance,
-      },
-    );
+    const hit = gizmo.raycast(origin, new hz.Vec3(dirX, 0, dirZ), {
+      layerType: hz.LayerType.Both,
+      maxDistance: this.props.wallProbeDistance,
+    });
 
     if (hit == null) {
       return false;
@@ -556,17 +735,17 @@ class TargetHealth extends hz.Component<typeof TargetHealth> {
       return false;
     }
 
-    return !this.isOwnHitbox(hit);
+    return !this.isHitbox(hit);
   }
 
-  private isOwnHitbox(hit: hz.RaycastHit): boolean {
+  /** Any zombie's hitbox, ours or another's - never treated as a wall. */
+  private isHitbox(hit: hz.RaycastHit): boolean {
     if (hit.targetType !== hz.RaycastTargetType.Entity) {
       return false;
     }
 
     return (
-      hit.target.tags.contains('head') ||
-      hit.target.tags.contains('body')
+      hit.target.tags.contains('head') || hit.target.tags.contains('body')
     );
   }
 
