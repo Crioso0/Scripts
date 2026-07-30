@@ -126,6 +126,7 @@ class TargetHealth extends hz.Component<typeof TargetHealth> {
   private ownGroundRaycast: hz.Entity | null = null;
 
   private blockedSeconds = 0;
+  private lastBlockedLogAt = 0;
   private steerCountdown = 0;
   private cachedHeading: {
     x: number;
@@ -339,12 +340,13 @@ class TargetHealth extends hz.Component<typeof TargetHealth> {
       requested.z,
     );
 
-    if (this.props.debugMovement) {
-      console.log(
-        `TargetHealth: spawn marker Y ${requested.y.toFixed(2)} -> ` +
-          `ground ${hit.hitPoint.y.toFixed(2)} -> placed ${grounded.y.toFixed(2)}`,
-      );
-    }
+    // Always printed: one line per spawn, and it is the single most useful
+    // thing when a zombie ends up in the floor.
+    console.log(
+      `TargetHealth: SPAWN marker Y ${requested.y.toFixed(2)} -> ` +
+        `ground ${hit.hitPoint.y.toFixed(2)} -> ` +
+        `placed ${grounded.y.toFixed(2)} (footHeight ${this.props.footHeight})`,
+    );
 
     return grounded;
   }
@@ -539,7 +541,11 @@ class TargetHealth extends hz.Component<typeof TargetHealth> {
       this.blockedSeconds += deltaTime;
 
       if (this.blockedSeconds < this.props.unstickAfterSeconds) {
-        if (this.props.debugMovement) {
+        // Throttled: this used to print every frame for every zombie and
+        // buried every other line in the console.
+        const now = Date.now();
+        if (this.props.debugMovement && now - this.lastBlockedLogAt > 1000) {
+          this.lastBlockedLogAt = now;
           console.log(
             `TargetHealth: blocked at ${myPos.toString()} ` +
               `(${this.blockedSeconds.toFixed(1)}s)`,
@@ -551,7 +557,9 @@ class TargetHealth extends hz.Component<typeof TargetHealth> {
       // Fully boxed in for too long - shove straight at the player rather
       // than stand still forever. A zombie spawned inside geometry would
       // otherwise never move again.
-      if (this.props.debugMovement) {
+      const now = Date.now();
+      if (this.props.debugMovement && now - this.lastBlockedLogAt > 1000) {
+        this.lastBlockedLogAt = now;
         console.log('TargetHealth: unsticking - forcing a step forward.');
       }
 
@@ -578,6 +586,17 @@ class TargetHealth extends hz.Component<typeof TargetHealth> {
     const nextZ = myPos.z + heading.z * step;
 
     if (heading.groundY == null) {
+      // No ground reading: hold height. If a zombie is stuck in the floor and
+      // never rises, this is the branch it is taking.
+      const now = Date.now();
+      if (this.props.debugMovement && now - this.lastBlockedLogAt > 1000) {
+        this.lastBlockedLogAt = now;
+        console.log(
+          `TargetHealth: no ground under me at ${myPos.toString()} - ` +
+            'holding height. footHeight cannot apply here.',
+        );
+      }
+
       this.entity.position.set(new hz.Vec3(nextX, myPos.y, nextZ));
       return;
     }
