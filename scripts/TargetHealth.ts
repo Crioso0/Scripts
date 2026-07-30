@@ -123,6 +123,7 @@ class TargetHealth extends hz.Component<typeof TargetHealth> {
   private ownHead: hz.Entity | null = null;
   private ownBarRoot: hz.Entity | null = null;
   private ownBarFill: hz.Entity | null = null;
+  private ownGroundRaycast: hz.Entity | null = null;
 
   private blockedSeconds = 0;
   private steerCountdown = 0;
@@ -171,8 +172,12 @@ class TargetHealth extends hz.Component<typeof TargetHealth> {
       console.warn('TargetHealth: could not resolve a health bar fill.');
     }
 
-    if (!this.props.groundRaycast) {
-      console.warn('TargetHealth: groundRaycast is not assigned.');
+    if (!this.ownGroundRaycast) {
+      console.warn(
+        'TargetHealth: no Raycast gizmo found among my children and no ' +
+          'groundRaycast prop set. Ground snapping and wall detection are ' +
+          'both disabled - this zombie will spawn at the marker height.',
+      );
     }
 
     const roundManaged = this.props.roundManaged;
@@ -214,19 +219,28 @@ class TargetHealth extends hz.Component<typeof TargetHealth> {
       } else if (!this.ownBarRoot && name.indexOf('HealthBar') >= 0) {
         this.ownBarRoot = entity;
       }
+
+      // Same reasoning as the mesh: a spawned copy's prop may still point at
+      // the template's gizmo, or at nothing at all.
+      if (!this.ownGroundRaycast && name.indexOf('Raycast') >= 0) {
+        this.ownGroundRaycast = entity;
+      }
     }
 
     this.ownBody = this.ownBody ?? this.props.bodyHitbox ?? null;
     this.ownHead = this.ownHead ?? this.props.headHitbox ?? null;
     this.ownBarRoot = this.ownBarRoot ?? this.props.healthBarRoot ?? null;
     this.ownBarFill = this.ownBarFill ?? this.props.healthBarFill ?? null;
+    this.ownGroundRaycast =
+      this.ownGroundRaycast ?? this.props.groundRaycast ?? null;
 
     if (this.props.debugMovement) {
       console.log(
         `TargetHealth: resolved parts body=${this.ownBody?.name.get() ?? 'none'} ` +
           `head=${this.ownHead?.name.get() ?? 'none'} ` +
           `barRoot=${this.ownBarRoot?.name.get() ?? 'none'} ` +
-          `barFill=${this.ownBarFill?.name.get() ?? 'none'}`,
+          `barFill=${this.ownBarFill?.name.get() ?? 'none'} ` +
+          `raycast=${this.ownGroundRaycast?.name.get() ?? 'NONE'}`,
       );
     }
   }
@@ -292,7 +306,7 @@ class TargetHealth extends hz.Component<typeof TargetHealth> {
    * marker below the terrain spawns the zombie inside the map.
    */
   private groundedSpawnPosition(requested: hz.Vec3): hz.Vec3 {
-    const gizmo = this.props.groundRaycast?.as(hz.RaycastGizmo);
+    const gizmo = this.ownGroundRaycast?.as(hz.RaycastGizmo);
     if (!gizmo) {
       return requested;
     }
@@ -731,7 +745,7 @@ class TargetHealth extends hz.Component<typeof TargetHealth> {
     dirX: number,
     dirZ: number,
   ): number | null {
-    const gizmo = this.props.groundRaycast?.as(hz.RaycastGizmo);
+    const gizmo = this.ownGroundRaycast?.as(hz.RaycastGizmo);
     if (!gizmo) {
       return null;
     }
@@ -755,7 +769,7 @@ class TargetHealth extends hz.Component<typeof TargetHealth> {
   }
 
   private isWallAhead(from: hz.Vec3, dirX: number, dirZ: number): boolean {
-    const gizmo = this.props.groundRaycast?.as(hz.RaycastGizmo);
+    const gizmo = this.ownGroundRaycast?.as(hz.RaycastGizmo);
     if (!gizmo) {
       return false;
     }
