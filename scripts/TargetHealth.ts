@@ -1,75 +1,45 @@
 import * as hz from 'horizon/core';
-import { NavMeshAgent } from 'horizon/navmesh';
+import { playerDamageEvent } from 'PlayerHealth';
 import { awardMoneyEvent, damageEvent } from 'GameEvents';
+
+/** Whisker angles tried in order, smallest deviation first. */
+const STEER_ANGLES = [30, 60, 90, 120, 150];
 
 /**
  * TargetHealth
  * ------------
- * Attach to the EMPTY root object of a target ("Target"), Motion: Animated.
- * Expects two collidable children tagged "head" and "body", plus a health
- * bar fill object.
+ * Enemy health, rewards, locomotion and melee attack.
  *
- * Editor requirements:
- *   - Navigation Locomotion -> Enabled = ON
- *   - Navigation -> Include in Bakes = OFF on this entity and all children,
- *     or the target is baked into the navmesh as an obstacle
- *   - A baked navigation profile named to match navProfileName, whose volume
- *     actually covers the floor the target stands on
- *
- * Destinations are the player's raw position, matching Meta's own NPCMonster
- * sample. An earlier version ran them through NavMesh.getNearestPoint first,
- * which made the target chase a snapped point metres away whenever the player
- * stood on unbaked ground.
- *
- * The raycast steering version (terrain probes, no navmesh) is preserved in
- * git at commit e29c930 if this needs to be swapped back out.
+ * damageEvent comes from GameEvents rather than being declared here. Horizon
+ * matches local events by object identity, not by name, so a second
+ * `new LocalEvent('damage')` in this file would be a different event from the
+ * one SimpleGun sends and no damage would ever arrive.
  */
 class TargetHealth extends hz.Component<typeof TargetHealth> {
   static propsDefinition = {
-    // --- health ---------------------------------------------------------
     maxHealth: { type: hz.PropTypes.Number, default: 100 },
 
     healthBarFill: { type: hz.PropTypes.Entity },
     healthText: { type: hz.PropTypes.Entity },
+    healthBarRoot: { type: hz.PropTypes.Entity },
 
     hitMarkerSfx: { type: hz.PropTypes.Entity },
     headshotKillSfx: { type: hz.PropTypes.Entity },
+    deathSfx: { type: hz.PropTypes.Entity },
 
-    respawnDelay: { type: hz.PropTypes.Number, default: 2 },
-    // Teleport back to the spawn point on respawn, as NPCMonster does.
-    returnToStartOnRespawn: { type: hz.PropTypes.Boolean, default: true },
+    enemyVisual: { type: hz.PropTypes.Entity },
+    bodyHitbox: { type: hz.PropTypes.Entity },
+    headHitbox: { type: hz.PropTypes.Entity },
 
-    // --- movement -------------------------------------------------------
-    chaseEnabled: { type: hz.PropTypes.Boolean, default: true },
-    // Must match a baked profile in Systems > Navigation.
-    navProfileName: { type: hz.PropTypes.String, default: 'Zombie' },
+    hideOnDeath: { type: hz.PropTypes.Boolean, default: true },
+    respawnDelay: { type: hz.PropTypes.Number, default: 3 },
 
-    moveSpeed: { type: hz.PropTypes.Number, default: 1.5 }, // metres/second
-    // The agent decelerates into this distance and stops.
-    stopDistance: { type: hz.PropTypes.Number, default: 2 },
-    // Reissuing the destination every frame is wasteful; interval in seconds.
-    repathInterval: { type: hz.PropTypes.Number, default: 0.25 },
+    playerHealthManager: { type: hz.PropTypes.Entity },
+    attackSfx: { type: hz.PropTypes.Entity },
 
-    /**
-     * Degrees of misalignment tolerated before the agent will walk forward.
-     * The default of 360 lets it slide off in any direction regardless of
-     * facing; 90 is what Meta's NPCAgent uses, and it turns convincingly.
-     */
-    requiredForwardAlignment: { type: hz.PropTypes.Number, default: 90 },
-
-    /**
-     * Distance from this entity's pivot to the navmesh surface. At 0 the pivot
-     * itself sits on the mesh, so a model whose pivot is at the waist sinks
-     * into the floor. Raise until the feet land.
-     */
-    baseOffset: { type: hz.PropTypes.Number, default: 0 },
-
-    /**
-     * Follow the real collision surface rather than the navmesh, which is a
-     * simplified approximation and drifts on slopes and curves. Costs a
-     * per-frame check, so leave off unless height looks wrong on inclines.
-     */
-    usePhysicalSurfaceSnapping: { type: hz.PropTypes.Boolean, default: false },
+    attackDamage: { type: hz.PropTypes.Number, default: 20 },
+    attackRange: { type: hz.PropTypes.Number, default: 2.1 },
+    attackCooldown: { type: hz.PropTypes.Number, default: 1 },
 
     // --- rewards --------------------------------------------------------
     // Call of Duty Zombies pays per hit, then a bonus on the kill.
@@ -77,34 +47,47 @@ class TargetHealth extends hz.Component<typeof TargetHealth> {
     moneyPerKill: { type: hz.PropTypes.Number, default: 50 },
     moneyPerHeadshotKill: { type: hz.PropTypes.Number, default: 100 },
 
+    chaseEnabled: { type: hz.PropTypes.Boolean, default: true },
+    moveSpeed: { type: hz.PropTypes.Number, default: 1.5 },
+    stopDistance: { type: hz.PropTypes.Number, default: 1.8 },
+
+    faceThePlayer: { type: hz.PropTypes.Boolean, default: true },
+    facingOffsetDegrees: { type: hz.PropTypes.Number, default: 0 },
+
+    sideCommitSeconds: { type: hz.PropTypes.Number, default: 1.2 },
+
+    groundRaycast: { type: hz.PropTypes.Entity },
+    probeAhead: { type: hz.PropTypes.Number, default: 0.6 },
+    probeHeight: { type: hz.PropTypes.Number, default: 1.5 },
+    maxDrop: { type: hz.PropTypes.Number, default: 5 },
+
+    bodyRadius: { type: hz.PropTypes.Number, default: 0.5 },
+    wallProbeDistance: { type: hz.PropTypes.Number, default: 0.8 },
+    wallProbeHeight: { type: hz.PropTypes.Number, default: 0.3 },
+
+    maxStepUp: { type: hz.PropTypes.Number, default: 0.5 },
+    maxStepDown: { type: hz.PropTypes.Number, default: 1 },
+    groundOffset: { type: hz.PropTypes.Number, default: 0 },
+
     debugMovement: { type: hz.PropTypes.Boolean, default: false },
   };
 
   private health = 0;
   private isDead = false;
+  private lastAttackTime = 0;
 
-  // Cached full-health transform of the bar fill, captured once at start.
   private fillFullScale: hz.Vec3 | null = null;
   private fillFullPosition: hz.Vec3 | null = null;
 
-  private agent: NavMeshAgent | null = null;
-  private startLocation: hz.Vec3 | null = null;
-  private repathCountdown = 0;
+  private spawnPosition: hz.Vec3 | null = null;
+  private spawnRotation: hz.Quaternion | null = null;
 
-  start() {
-    this.health = this.props.maxHealth;
-    this.startLocation = this.entity.position.get().clone();
+  private footOffset: number | null = null;
 
-    const fill = this.props.healthBarFill;
-    if (fill) {
-      this.fillFullScale = fill.transform.localScale.get().clone();
-      this.fillFullPosition = fill.transform.localPosition.get().clone();
-    } else {
-      console.warn('TargetHealth: healthBarFill prop is not set.');
-    }
+  private preferredSide = 0;
+  private sideCommitCountdown = 0;
 
-    this.setUpAgent();
-
+  preStart() {
     this.connectLocalEvent(this.entity, damageEvent, (data) => {
       this.takeDamage(data.attacker, data.amount, data.isHeadshot);
     });
@@ -115,23 +98,40 @@ class TargetHealth extends hz.Component<typeof TargetHealth> {
         this.chaseTick(data.deltaTime);
       },
     );
-
-    this.refreshBar();
   }
 
-  private setUpAgent() {
-    // as() returns a wrapper whether or not Navigation Locomotion is enabled,
-    // so this succeeding is not proof the editor side is set up.
-    const agent = this.entity.as(NavMeshAgent);
-    this.agent = agent;
+  start() {
+    this.health = Math.max(1, this.props.maxHealth);
 
-    agent.profileName.set(this.props.navProfileName);
-    agent.maxSpeed.set(this.props.moveSpeed);
-    agent.stoppingDistance.set(this.props.stopDistance);
-    agent.requiredForwardAlignment.set(this.props.requiredForwardAlignment);
-    agent.baseOffset.set(this.props.baseOffset);
-    agent.usePhysicalSurfaceSnapping.set(this.props.usePhysicalSurfaceSnapping);
-    agent.isImmobile.set(false);
+    this.spawnPosition = this.entity.position.get().clone();
+    this.spawnRotation = this.entity.rotation.get().clone();
+
+    const fill = this.props.healthBarFill;
+    if (fill) {
+      this.fillFullScale = fill.transform.localScale.get().clone();
+      this.fillFullPosition = fill.transform.localPosition.get().clone();
+    } else {
+      console.warn('TargetHealth: healthBarFill prop is not set.');
+    }
+
+    if (!this.props.groundRaycast) {
+      console.warn(
+        'TargetHealth: groundRaycast prop is not set. The target will walk ' +
+          'at a fixed height and may clip through terrain.',
+      );
+    }
+
+    if (!this.props.playerHealthManager) {
+      console.warn(
+        'TargetHealth: playerHealthManager is not assigned. ' +
+          'The enemy cannot damage the player.',
+      );
+    }
+
+    this.setEnemyAlive(true);
+    this.refreshBar();
+
+    console.log('TargetHealth: enemy health and attack system ready');
   }
 
   // ---------------------------------------------------------------- health
@@ -145,13 +145,13 @@ class TargetHealth extends hz.Component<typeof TargetHealth> {
       return;
     }
 
-    // Hit marker fires on every connect, regardless of where it landed.
     this.props.hitMarkerSfx?.as(hz.AudioGizmo)?.play();
 
-    this.health = Math.max(0, this.health - amount);
+    this.health = Math.max(0, this.health - Math.max(0, amount));
 
     console.log(
-      `TargetHealth: ${isHeadshot ? 'head' : 'body'} for ${amount} -> ${this.health}/${this.props.maxHealth}`,
+      `TargetHealth: ${isHeadshot ? 'head' : 'body'} for ${amount} -> ` +
+        `${this.health}/${this.props.maxHealth}`,
     );
 
     this.pay(attacker, this.props.moneyPerHit, 'hit');
@@ -163,39 +163,45 @@ class TargetHealth extends hz.Component<typeof TargetHealth> {
     }
   }
 
-  /** killedByHeadshot: was the FINAL shot a headshot? */
   private die(killer: hz.Player, killedByHeadshot: boolean) {
+    if (this.isDead) {
+      return;
+    }
+
     this.isDead = true;
+    this.setEnemyAlive(false);
 
     if (killedByHeadshot) {
       this.props.headshotKillSfx?.as(hz.AudioGizmo)?.play();
       console.log('TargetHealth: HEADSHOT KILL');
       this.pay(killer, this.props.moneyPerHeadshotKill, 'headshot kill');
     } else {
+      this.props.deathSfx?.as(hz.AudioGizmo)?.play();
       console.log('TargetHealth: TARGET DOWN');
       this.pay(killer, this.props.moneyPerKill, 'kill');
     }
 
-    // isImmobile plants the agent; clearing the destination drops its path.
-    this.agent?.isImmobile.set(true);
-    this.agent?.destination.set(null);
-
     this.async.setTimeout(() => {
-      this.respawn();
+      this.health = Math.max(1, this.props.maxHealth);
+      this.footOffset = null;
+      this.preferredSide = 0;
+      this.sideCommitCountdown = 0;
+      this.lastAttackTime = 0;
+
+      if (this.spawnPosition) {
+        this.entity.position.set(this.spawnPosition);
+      }
+
+      if (this.spawnRotation) {
+        this.entity.rotation.set(this.spawnRotation);
+      }
+
+      this.isDead = false;
+      this.setEnemyAlive(true);
+      this.refreshBar();
+
+      console.log('TargetHealth: target respawned with full health');
     }, this.props.respawnDelay * 1000);
-  }
-
-  private respawn() {
-    if (this.props.returnToStartOnRespawn && this.startLocation) {
-      this.entity.position.set(this.startLocation);
-    }
-
-    this.health = this.props.maxHealth;
-    this.isDead = false;
-    this.agent?.isImmobile.set(false);
-    this.refreshBar();
-
-    console.log('TargetHealth: target reset to full health');
   }
 
   /** Broadcast so ScoreHud - or anything else keeping score - can react. */
@@ -207,65 +213,381 @@ class TargetHealth extends hz.Component<typeof TargetHealth> {
     this.sendLocalBroadcastEvent(awardMoneyEvent, { player, amount, reason });
   }
 
+  private setEnemyAlive(alive: boolean) {
+    if (this.props.hideOnDeath) {
+      this.props.enemyVisual?.visible.set(alive);
+    }
+
+    this.props.healthBarRoot?.visible.set(alive);
+
+    this.props.bodyHitbox?.collidable.set(alive);
+    this.props.headHitbox?.collidable.set(alive);
+  }
+
   private refreshBar() {
-    const fraction = this.health / this.props.maxHealth;
+    const maxHealth = Math.max(1, this.props.maxHealth);
+    const fraction = Math.max(0, Math.min(1, this.health / maxHealth));
 
     const fill = this.props.healthBarFill;
+
     if (fill && this.fillFullScale && this.fillFullPosition) {
-      // Shrink along local X.
       const scale = this.fillFullScale.clone();
       scale.x = this.fillFullScale.x * fraction;
       fill.transform.localScale.set(scale);
 
-      // Slide left by half of what we removed, so the bar drains from one
-      // end instead of shrinking towards its own centre.
       const position = this.fillFullPosition.clone();
       position.x =
-        this.fillFullPosition.x - (this.fillFullScale.x * (1 - fraction)) / 2;
+        this.fillFullPosition.x -
+        (this.fillFullScale.x * (1 - fraction)) / 2;
+
       fill.transform.localPosition.set(position);
     }
 
     const text = this.props.healthText;
+
     if (text) {
-      text.as(hz.TextGizmo)?.text.set(`${this.health} / ${this.props.maxHealth}`);
+      text
+        .as(hz.TextGizmo)
+        ?.text.set(`${this.health} / ${maxHealth}`);
     }
   }
 
   // -------------------------------------------------------------- movement
 
   private chaseTick(deltaTime: number) {
-    const agent = this.agent;
-    if (!agent || !this.props.chaseEnabled || this.isDead) {
+    if (!this.props.chaseEnabled || this.isDead) {
       return;
     }
 
-    this.repathCountdown -= deltaTime;
-    if (this.repathCountdown > 0) {
-      return;
-    }
-    this.repathCountdown = this.props.repathInterval;
+    const myPos = this.entity.position.get();
+    const player = this.nearestPlayer(myPos);
 
-    const player = this.nearestPlayerPosition(this.entity.position.get());
     if (!player) {
       return;
     }
 
-    // Raw player position, no snapping. See the class comment.
-    agent.destination.set(player);
+    const playerPos = player.position.get();
 
-    if (this.props.debugMovement) {
-      console.log(
-        `TargetHealth: speed ${agent.currentSpeed.get().toFixed(2)} ` +
-          `remaining ${agent.remainingDistance.get().toFixed(2)} ` +
-          `waypoints ${agent.path.get().length}`,
-      );
+    const dx = playerPos.x - myPos.x;
+    const dz = playerPos.z - myPos.z;
+    const distance = Math.sqrt(dx * dx + dz * dz);
+
+    if (distance < 0.001) {
+      return;
     }
+
+    const toPlayerX = dx / distance;
+    const toPlayerZ = dz / distance;
+
+    this.tryAttack(player, distance);
+
+    if (distance <= this.props.stopDistance) {
+      this.faceDirection(toPlayerX, toPlayerZ);
+      this.preferredSide = 0;
+      this.sideCommitCountdown = 0;
+      return;
+    }
+
+    const heading = this.chooseHeading(
+      myPos,
+      toPlayerX,
+      toPlayerZ,
+      deltaTime,
+    );
+
+    if (!heading) {
+      this.faceDirection(toPlayerX, toPlayerZ);
+
+      if (this.props.debugMovement) {
+        console.log('TargetHealth: no walkable heading - fully blocked.');
+      }
+
+      return;
+    }
+
+    this.faceDirection(heading.x, heading.z);
+
+    const step = Math.min(
+      this.props.moveSpeed * deltaTime,
+      distance - this.props.stopDistance,
+    );
+
+    const nextX = myPos.x + heading.x * step;
+    const nextZ = myPos.z + heading.z * step;
+
+    if (heading.groundY == null) {
+      this.entity.position.set(new hz.Vec3(nextX, myPos.y, nextZ));
+      return;
+    }
+
+    if (this.footOffset == null) {
+      this.footOffset = myPos.y - heading.groundY;
+
+      if (this.props.debugMovement) {
+        console.log(
+          `TargetHealth: calibrated footOffset ` +
+            `${this.footOffset.toFixed(2)}m`,
+        );
+      }
+    }
+
+    const desiredY =
+      heading.groundY + this.footOffset + this.props.groundOffset;
+
+    this.entity.position.set(new hz.Vec3(nextX, desiredY, nextZ));
   }
 
-  private nearestPlayerPosition(from: hz.Vec3): hz.Vec3 | null {
+  private tryAttack(player: hz.Player, distance: number) {
+    if (distance > this.props.attackRange) {
+      return;
+    }
+
+    const now = Date.now();
+
+    if (now - this.lastAttackTime < this.props.attackCooldown * 1000) {
+      return;
+    }
+
+    this.lastAttackTime = now;
+
+    const manager = this.props.playerHealthManager;
+
+    if (!manager) {
+      console.warn(
+        'TargetHealth: enemy tried to attack, but ' +
+          'playerHealthManager is not assigned.',
+      );
+      return;
+    }
+
+    this.props.attackSfx?.as(hz.AudioGizmo)?.play();
+
+    this.sendLocalEvent(manager, playerDamageEvent, {
+      player,
+      amount: this.props.attackDamage,
+    });
+
+    console.log(
+      `TargetHealth: attacked "${player.name.get()}" for ` +
+        `${this.props.attackDamage} damage`,
+    );
+  }
+
+  private chooseHeading(
+    from: hz.Vec3,
+    toPlayerX: number,
+    toPlayerZ: number,
+    deltaTime: number,
+  ): { x: number; z: number; groundY: number | null } | null {
+    this.sideCommitCountdown -= deltaTime;
+
+    if (this.sideCommitCountdown <= 0) {
+      this.preferredSide = 0;
+    }
+
+    for (const angle of this.buildAngles()) {
+      const heading = this.rotateHeading(toPlayerX, toPlayerZ, angle);
+      const probe = this.evaluateHeading(from, heading.x, heading.z);
+
+      if (!probe.walkable) {
+        continue;
+      }
+
+      if (angle === 0) {
+        this.preferredSide = 0;
+        this.sideCommitCountdown = 0;
+      } else {
+        this.preferredSide = angle > 0 ? 1 : -1;
+        this.sideCommitCountdown = this.props.sideCommitSeconds;
+
+        if (this.props.debugMovement) {
+          console.log(
+            `TargetHealth: detouring ${angle} degrees off-target.`,
+          );
+        }
+      }
+
+      return {
+        x: heading.x,
+        z: heading.z,
+        groundY: probe.groundY,
+      };
+    }
+
+    return null;
+  }
+
+  private buildAngles(): number[] {
+    const side = this.preferredSide === 0 ? 1 : this.preferredSide;
+    const angles: number[] = [0];
+
+    for (const magnitude of STEER_ANGLES) {
+      angles.push(magnitude * side);
+      angles.push(-magnitude * side);
+    }
+
+    return angles;
+  }
+
+  private rotateHeading(
+    x: number,
+    z: number,
+    degrees: number,
+  ): { x: number; z: number } {
+    const radians = (degrees * Math.PI) / 180;
+    const cos = Math.cos(radians);
+    const sin = Math.sin(radians);
+
+    return {
+      x: x * cos + z * sin,
+      z: -x * sin + z * cos,
+    };
+  }
+
+  private evaluateHeading(
+    from: hz.Vec3,
+    dirX: number,
+    dirZ: number,
+  ): { walkable: boolean; groundY: number | null } {
+    if (this.isWallAhead(from, dirX, dirZ)) {
+      return {
+        walkable: false,
+        groundY: null,
+      };
+    }
+
+    const groundY = this.probeGround(from, dirX, dirZ);
+
+    if (groundY == null) {
+      return {
+        walkable: true,
+        groundY: null,
+      };
+    }
+
+    if (this.footOffset == null) {
+      return {
+        walkable: true,
+        groundY,
+      };
+    }
+
+    const desiredY =
+      groundY + this.footOffset + this.props.groundOffset;
+
+    const rise = desiredY - from.y;
+
+    if (
+      rise > this.props.maxStepUp ||
+      rise < -this.props.maxStepDown
+    ) {
+      return {
+        walkable: false,
+        groundY,
+      };
+    }
+
+    return {
+      walkable: true,
+      groundY,
+    };
+  }
+
+  private probeGround(
+    from: hz.Vec3,
+    dirX: number,
+    dirZ: number,
+  ): number | null {
+    const gizmo = this.props.groundRaycast?.as(hz.RaycastGizmo);
+
+    if (!gizmo) {
+      return null;
+    }
+
+    const origin = new hz.Vec3(
+      from.x + dirX * this.props.probeAhead,
+      from.y + this.props.probeHeight,
+      from.z + dirZ * this.props.probeAhead,
+    );
+
+    const hit = gizmo.raycast(origin, new hz.Vec3(0, -1, 0), {
+      layerType: hz.LayerType.Both,
+      maxDistance: this.props.probeHeight + this.props.maxDrop,
+    });
+
+    if (hit == null || this.isOwnHitbox(hit)) {
+      return null;
+    }
+
+    return hit.hitPoint.y;
+  }
+
+  private isWallAhead(
+    from: hz.Vec3,
+    dirX: number,
+    dirZ: number,
+  ): boolean {
+    const gizmo = this.props.groundRaycast?.as(hz.RaycastGizmo);
+
+    if (!gizmo) {
+      return false;
+    }
+
+    const origin = new hz.Vec3(
+      from.x + dirX * this.props.bodyRadius,
+      from.y + this.props.wallProbeHeight,
+      from.z + dirZ * this.props.bodyRadius,
+    );
+
+    const hit = gizmo.raycast(
+      origin,
+      new hz.Vec3(dirX, 0, dirZ),
+      {
+        layerType: hz.LayerType.Both,
+        maxDistance: this.props.wallProbeDistance,
+      },
+    );
+
+    if (hit == null) {
+      return false;
+    }
+
+    if (hit.targetType === hz.RaycastTargetType.Player) {
+      return false;
+    }
+
+    return !this.isOwnHitbox(hit);
+  }
+
+  private isOwnHitbox(hit: hz.RaycastHit): boolean {
+    if (hit.targetType !== hz.RaycastTargetType.Entity) {
+      return false;
+    }
+
+    return (
+      hit.target.tags.contains('head') ||
+      hit.target.tags.contains('body')
+    );
+  }
+
+  private faceDirection(dirX: number, dirZ: number) {
+    if (!this.props.faceThePlayer) {
+      return;
+    }
+
+    const yaw =
+      (Math.atan2(dirX, dirZ) * 180) / Math.PI +
+      this.props.facingOffsetDegrees;
+
+    this.entity.rotation.set(
+      hz.Quaternion.fromEuler(new hz.Vec3(0, yaw, 0)),
+    );
+  }
+
+  private nearestPlayer(from: hz.Vec3): hz.Player | null {
     const players = this.world.getPlayers();
 
-    let nearest: hz.Vec3 | null = null;
+    let nearest: hz.Player | null = null;
     let nearestDistanceSq = Number.MAX_VALUE;
 
     for (const player of players) {
@@ -276,7 +598,7 @@ class TargetHealth extends hz.Component<typeof TargetHealth> {
 
       if (distanceSq < nearestDistanceSq) {
         nearestDistanceSq = distanceSq;
-        nearest = position;
+        nearest = player;
       }
     }
 
