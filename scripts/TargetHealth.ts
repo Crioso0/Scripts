@@ -88,7 +88,15 @@ class TargetHealth extends hz.Component<typeof TargetHealth> {
 
     maxStepUp: { type: hz.PropTypes.Number, default: 0.5 },
     maxStepDown: { type: hz.PropTypes.Number, default: 1 },
-    groundOffset: { type: hz.PropTypes.Number, default: 0 },
+
+    /**
+     * Distance from this entity's pivot down to the feet. Replaces the old
+     * auto-calibrated offset, which measured itself AFTER the zombie had been
+     * teleported to a spawn point - so a spawn point floating above or below
+     * the terrain baked that error in permanently and the zombie flew or
+     * burrowed for the rest of its life.
+     */
+    footHeight: { type: hz.PropTypes.Number, default: 0.9 },
 
     debugMovement: { type: hz.PropTypes.Boolean, default: false },
 
@@ -106,8 +114,6 @@ class TargetHealth extends hz.Component<typeof TargetHealth> {
 
   private spawnPosition: hz.Vec3 | null = null;
   private spawnRotation: hz.Quaternion | null = null;
-
-  private footOffset: number | null = null;
 
   private preferredSide = 0;
   private sideCommitCountdown = 0;
@@ -257,7 +263,6 @@ class TargetHealth extends hz.Component<typeof TargetHealth> {
 
     this.health = Math.max(1, this.props.maxHealth);
 
-    this.footOffset = null;
     this.preferredSide = 0;
     this.sideCommitCountdown = 0;
     this.lastAttackTime = 0;
@@ -265,7 +270,9 @@ class TargetHealth extends hz.Component<typeof TargetHealth> {
     this.steerCountdown = 0;
     this.cachedHeading = null;
 
-    this.entity.position.set(position);
+    // The spawn point's own height is not trusted; find the real ground
+    // beneath it so a badly placed marker cannot bury or levitate a zombie.
+    this.entity.position.set(this.groundedSpawnPosition(position));
     this.entity.rotation.set(rotation);
 
     this.isDead = false;
@@ -278,6 +285,52 @@ class TargetHealth extends hz.Component<typeof TargetHealth> {
   }
 
   // ---------------------------------------------------------------- health
+
+  /**
+   * Places a spawn position on the real ground. Spawn markers get dragged
+   * around in the editor and end up at arbitrary heights; without this, a
+   * marker below the terrain spawns the zombie inside the map.
+   */
+  private groundedSpawnPosition(requested: hz.Vec3): hz.Vec3 {
+    const gizmo = this.props.groundRaycast?.as(hz.RaycastGizmo);
+    if (!gizmo) {
+      return requested;
+    }
+
+    // Search generously above and below - a marker may sit either side of the
+    // surface, and we have no idea which.
+    const searchAbove = 20;
+    const searchTotal = searchAbove + 60;
+
+    const hit = gizmo.raycast(
+      new hz.Vec3(requested.x, requested.y + searchAbove, requested.z),
+      new hz.Vec3(0, -1, 0),
+      { layerType: hz.LayerType.Both, maxDistance: searchTotal },
+    );
+
+    if (hit == null || this.isHitbox(hit)) {
+      console.warn(
+        `TargetHealth: no ground found near spawn ${requested.toString()}; ` +
+          'using the marker height as-is.',
+      );
+      return requested;
+    }
+
+    const grounded = new hz.Vec3(
+      requested.x,
+      hit.hitPoint.y + this.props.footHeight,
+      requested.z,
+    );
+
+    if (this.props.debugMovement) {
+      console.log(
+        `TargetHealth: spawn marker Y ${requested.y.toFixed(2)} -> ` +
+          `ground ${hit.hitPoint.y.toFixed(2)} -> placed ${grounded.y.toFixed(2)}`,
+      );
+    }
+
+    return grounded;
+  }
 
   private takeDamage(
     attacker: hz.Player,
@@ -351,7 +404,6 @@ class TargetHealth extends hz.Component<typeof TargetHealth> {
   private resetStandaloneEnemy() {
     this.health = Math.max(1, this.props.maxHealth);
 
-    this.footOffset = null;
     this.preferredSide = 0;
     this.sideCommitCountdown = 0;
     this.lastAttackTime = 0;
@@ -513,12 +565,7 @@ class TargetHealth extends hz.Component<typeof TargetHealth> {
       return;
     }
 
-    if (this.footOffset == null) {
-      this.footOffset = myPos.y - heading.groundY;
-    }
-
-    const desiredY =
-      heading.groundY + this.footOffset + this.props.groundOffset;
+    const desiredY = heading.groundY + this.props.footHeight;
 
     this.entity.position.set(new hz.Vec3(nextX, desiredY, nextZ));
   }
@@ -669,11 +716,7 @@ class TargetHealth extends hz.Component<typeof TargetHealth> {
       return { walkable: true, groundY: null };
     }
 
-    if (this.footOffset == null) {
-      return { walkable: true, groundY };
-    }
-
-    const desiredY = groundY + this.footOffset + this.props.groundOffset;
+    const desiredY = groundY + this.props.footHeight;
     const rise = desiredY - from.y;
 
     if (rise > this.props.maxStepUp || rise < -this.props.maxStepDown) {
