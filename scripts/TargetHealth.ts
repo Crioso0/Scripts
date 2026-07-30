@@ -385,9 +385,10 @@ class TargetHealth extends hz.Component<typeof TargetHealth> {
   }
 
   private setEnemyAlive(alive: boolean) {
+    // Only the body's visibility is touched. The head is an intentionally
+    // invisible hitbox, so showing it would put a floating sphere on screen.
     if (this.props.hideOnDeath) {
       this.ownBody?.visible.set(alive);
-      this.ownHead?.visible.set(alive);
     }
 
     this.ownBarRoot?.visible.set(alive);
