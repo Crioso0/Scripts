@@ -65,6 +65,20 @@ class TargetHealth extends hz.Component<typeof TargetHealth> {
      */
     requiredForwardAlignment: { type: hz.PropTypes.Number, default: 90 },
 
+    /**
+     * Distance from this entity's pivot to the navmesh surface. At 0 the pivot
+     * itself sits on the mesh, so a model whose pivot is at the waist sinks
+     * into the floor. Raise until the feet land.
+     */
+    baseOffset: { type: hz.PropTypes.Number, default: 0 },
+
+    /**
+     * Follow the real collision surface rather than the navmesh, which is a
+     * simplified approximation and drifts on slopes and curves. Costs a
+     * per-frame check, so leave off unless height looks wrong on inclines.
+     */
+    usePhysicalSurfaceSnapping: { type: hz.PropTypes.Boolean, default: false },
+
     debugMovement: { type: hz.PropTypes.Boolean, default: false },
   };
 
@@ -117,6 +131,8 @@ class TargetHealth extends hz.Component<typeof TargetHealth> {
     agent.maxSpeed.set(this.props.moveSpeed);
     agent.stoppingDistance.set(this.props.stopDistance);
     agent.requiredForwardAlignment.set(this.props.requiredForwardAlignment);
+    agent.baseOffset.set(this.props.baseOffset);
+    agent.usePhysicalSurfaceSnapping.set(this.props.usePhysicalSurfaceSnapping);
     agent.isImmobile.set(false);
   }
 
