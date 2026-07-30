@@ -1,14 +1,6 @@
 import * as hz from 'horizon/core';
 import { NavMeshAgent } from 'horizon/navmesh';
-
-/**
- * Sent by the gun to whichever entity owns a TargetHealth component.
- * Exported so SimpleGun can import it.
- */
-export const damageEvent = new hz.LocalEvent<{
-  amount: number;
-  isHeadshot: boolean;
-}>('damage');
+import { awardMoneyEvent, damageEvent } from 'GameEvents';
 
 /**
  * TargetHealth
@@ -79,6 +71,12 @@ class TargetHealth extends hz.Component<typeof TargetHealth> {
      */
     usePhysicalSurfaceSnapping: { type: hz.PropTypes.Boolean, default: false },
 
+    // --- rewards --------------------------------------------------------
+    // Call of Duty Zombies pays per hit, then a bonus on the kill.
+    moneyPerHit: { type: hz.PropTypes.Number, default: 10 },
+    moneyPerKill: { type: hz.PropTypes.Number, default: 50 },
+    moneyPerHeadshotKill: { type: hz.PropTypes.Number, default: 100 },
+
     debugMovement: { type: hz.PropTypes.Boolean, default: false },
   };
 
@@ -108,7 +106,7 @@ class TargetHealth extends hz.Component<typeof TargetHealth> {
     this.setUpAgent();
 
     this.connectLocalEvent(this.entity, damageEvent, (data) => {
-      this.takeDamage(data.amount, data.isHeadshot);
+      this.takeDamage(data.attacker, data.amount, data.isHeadshot);
     });
 
     this.connectLocalBroadcastEvent(
@@ -138,7 +136,11 @@ class TargetHealth extends hz.Component<typeof TargetHealth> {
 
   // ---------------------------------------------------------------- health
 
-  private takeDamage(amount: number, isHeadshot: boolean) {
+  private takeDamage(
+    attacker: hz.Player,
+    amount: number,
+    isHeadshot: boolean,
+  ) {
     if (this.isDead) {
       return;
     }
@@ -152,22 +154,26 @@ class TargetHealth extends hz.Component<typeof TargetHealth> {
       `TargetHealth: ${isHeadshot ? 'head' : 'body'} for ${amount} -> ${this.health}/${this.props.maxHealth}`,
     );
 
+    this.pay(attacker, this.props.moneyPerHit, 'hit');
+
     this.refreshBar();
 
     if (this.health <= 0) {
-      this.die(isHeadshot);
+      this.die(attacker, isHeadshot);
     }
   }
 
   /** killedByHeadshot: was the FINAL shot a headshot? */
-  private die(killedByHeadshot: boolean) {
+  private die(killer: hz.Player, killedByHeadshot: boolean) {
     this.isDead = true;
 
     if (killedByHeadshot) {
       this.props.headshotKillSfx?.as(hz.AudioGizmo)?.play();
       console.log('TargetHealth: HEADSHOT KILL');
+      this.pay(killer, this.props.moneyPerHeadshotKill, 'headshot kill');
     } else {
       console.log('TargetHealth: TARGET DOWN');
+      this.pay(killer, this.props.moneyPerKill, 'kill');
     }
 
     // isImmobile plants the agent; clearing the destination drops its path.
@@ -190,6 +196,15 @@ class TargetHealth extends hz.Component<typeof TargetHealth> {
     this.refreshBar();
 
     console.log('TargetHealth: target reset to full health');
+  }
+
+  /** Broadcast so ScoreHud - or anything else keeping score - can react. */
+  private pay(player: hz.Player, amount: number, reason: string) {
+    if (amount <= 0) {
+      return;
+    }
+
+    this.sendLocalBroadcastEvent(awardMoneyEvent, { player, amount, reason });
   }
 
   private refreshBar() {

@@ -1,5 +1,5 @@
 import * as hz from 'horizon/core';
-import { damageEvent } from 'TargetHealth';
+import { damageEvent } from 'GameEvents';
 
 /**
  * SimpleGun
@@ -113,6 +113,7 @@ class SimpleGun extends hz.Component<typeof SimpleGun> {
     );
 
     this.sendLocalEvent(found.owner, damageEvent, {
+      attacker: player,
       amount,
       isHeadshot: found.isHead,
     });
