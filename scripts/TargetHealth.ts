@@ -127,6 +127,7 @@ class TargetHealth extends hz.Component<typeof TargetHealth> {
 
   private blockedSeconds = 0;
   private lastBlockedLogAt = 0;
+  private lastGroundLogAt = 0;
   private steerCountdown = 0;
   private cachedHeading: {
     x: number;
@@ -541,6 +542,12 @@ class TargetHealth extends hz.Component<typeof TargetHealth> {
       return;
     }
 
+    // Height first, and unconditionally. Every movement branch below can
+    // return early - stopped, blocked, unsticking - and previously all of
+    // them skipped height correction, so a zombie that spawned buried simply
+    // stayed buried no matter what footHeight said.
+    this.applyGroundHeight();
+
     const myPos = this.entity.position.get();
     const player = this.nearestPlayer(myPos);
     if (!player) {
@@ -628,25 +635,60 @@ class TargetHealth extends hz.Component<typeof TargetHealth> {
     const nextX = myPos.x + heading.x * step;
     const nextZ = myPos.z + heading.z * step;
 
-    if (heading.groundY == null) {
-      // No ground reading: hold height. If a zombie is stuck in the floor and
-      // never rises, this is the branch it is taking.
-      const now = Date.now();
-      if (this.props.debugMovement && now - this.lastBlockedLogAt > 1000) {
-        this.lastBlockedLogAt = now;
-        console.log(
-          `TargetHealth: no ground under me at ${myPos.toString()} - ` +
-            'holding height. footHeight cannot apply here.',
-        );
-      }
+    // Y is applyGroundHeight's job; movement only moves horizontally.
+    this.entity.position.set(
+      new hz.Vec3(nextX, this.entity.position.get().y, nextZ),
+    );
+  }
 
-      this.entity.position.set(new hz.Vec3(nextX, myPos.y, nextZ));
+  /**
+   * Keeps the model's feet on the surface beneath it, every frame, whatever
+   * else it is doing.
+   *
+   * The probe is offset sideways by bodyRadius because a ray starting inside
+   * the body just hits the body.
+   */
+  private applyGroundHeight() {
+    const gizmo = this.ownGroundRaycast?.as(hz.RaycastGizmo);
+    if (!gizmo) {
       return;
     }
 
-    const desiredY = heading.groundY + this.props.footHeight;
+    const here = this.entity.position.get();
 
-    this.entity.position.set(new hz.Vec3(nextX, desiredY, nextZ));
+    const hit = gizmo.raycast(
+      new hz.Vec3(
+        here.x + this.props.bodyRadius,
+        here.y + this.props.probeHeight,
+        here.z,
+      ),
+      new hz.Vec3(0, -1, 0),
+      {
+        layerType: hz.LayerType.Both,
+        maxDistance: this.props.probeHeight + this.props.maxDrop,
+      },
+    );
+
+    if (hit == null || this.isHitbox(hit)) {
+      const now = Date.now();
+      if (this.props.debugMovement && now - this.lastGroundLogAt > 2000) {
+        this.lastGroundLogAt = now;
+        console.log(
+          `TargetHealth: no ground beneath me at ${here.toString()} - ` +
+            'holding height.',
+        );
+      }
+      return;
+    }
+
+    const desiredY = hit.hitPoint.y + this.props.footHeight;
+
+    // Skip micro-writes; only correct when it actually matters.
+    if (Math.abs(desiredY - here.y) < 0.01) {
+      return;
+    }
+
+    this.entity.position.set(new hz.Vec3(here.x, desiredY, here.z));
   }
 
   /**
