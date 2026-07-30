@@ -286,7 +286,9 @@ class TargetHealth extends hz.Component<typeof TargetHealth> {
 
     // The spawn point's own height is not trusted; find the real ground
     // beneath it so a badly placed marker cannot bury or levitate a zombie.
-    this.entity.position.set(this.groundedSpawnPosition(position));
+    const placed = this.groundedSpawnPosition(position);
+
+    this.entity.position.set(placed);
     this.entity.rotation.set(rotation);
 
     this.isDead = false;
@@ -295,7 +297,8 @@ class TargetHealth extends hz.Component<typeof TargetHealth> {
     this.setEnemyAlive(true);
     this.refreshBar();
 
-    console.log(`TargetHealth: zombie activated at ${position.toString()}`);
+    // Log where it actually ended up, not the marker we were handed.
+    console.log(`TargetHealth: zombie activated at ${placed.toString()}`);
   }
 
   // ---------------------------------------------------------------- health
