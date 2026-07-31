@@ -333,29 +333,6 @@ class TargetHealth extends hz.Component<typeof TargetHealth> {
     return groundY + this.props.footHeight;
   }
 
-  /**
-   * Puts the feet on the surface. Runs every frame regardless of what the
-   * enemy is doing - standing, blocked and unsticking all used to skip this,
-   * so anything that spawned buried stayed buried.
-   */
-  private applyGroundHeight() {
-    const here = this.entity.position.get();
-    const groundY = this.groundBeneath(here.x, here.z, here.y);
-
-    if (groundY == null) {
-      this.debug(`no ground beneath me at ${here.toString()}`);
-      return;
-    }
-
-    const target = this.restingY(groundY);
-
-    if (Math.abs(target - here.y) < 0.01) {
-      return;
-    }
-
-    this.entity.position.set(new hz.Vec3(here.x, target, here.z));
-  }
-
   /** Calibration aid: prints the footHeight matching the current pose. */
   private reportCalibration() {
     const here = this.entity.position.get();
@@ -608,35 +585,67 @@ class TargetHealth extends hz.Component<typeof TargetHealth> {
   // per-frame
   // =====================================================================
 
+  /**
+   * One read, one write, per frame.
+   *
+   * Height and movement used to be two separate position.set() calls. A set()
+   * is not guaranteed to be visible to a get() on the same frame, so the
+   * movement write kept resurrecting the pre-correction Y and burying the
+   * model - but only while it was actually moving, which is why standing
+   * still looked perfect.
+   */
   private tick(deltaTime: number) {
     if (this.isDead || !this.isActive) {
       return;
     }
 
-    // Height first and unconditionally: every branch below can return early.
-    this.applyGroundHeight();
+    const here = this.entity.position.get();
 
-    if (!this.props.chaseEnabled) {
-      return;
+    const destination = this.props.chaseEnabled
+      ? this.planMove(deltaTime, here)
+      : null;
+
+    const nextX = destination ? destination.x : here.x;
+    const nextZ = destination ? destination.z : here.z;
+
+    // Ground is sampled at where we are going, not where we were.
+    const groundY = this.groundBeneath(nextX, nextZ, here.y);
+
+    if (groundY == null) {
+      this.debug(
+        `no ground at ${nextX.toFixed(1)}, ${nextZ.toFixed(1)} - holding height`,
+      );
     }
 
-    const myPos = this.entity.position.get();
-    const player = this.nearestPlayer(myPos);
+    const nextY = groundY == null ? here.y : this.restingY(groundY);
+
+    this.entity.position.set(new hz.Vec3(nextX, nextY, nextZ));
+  }
+
+  /**
+   * Decides where to stand next, horizontally. Returns null to stay put.
+   * Never writes position - that is tick's job, once.
+   */
+  private planMove(
+    deltaTime: number,
+    here: hz.Vec3,
+  ): { x: number; z: number } | null {
+    const player = this.nearestPlayer(here);
     if (!player) {
-      return;
+      return null;
     }
 
     const playerPos = player.position.get();
 
-    const dx = playerPos.x - myPos.x;
-    const dy = playerPos.y - myPos.y;
-    const dz = playerPos.z - myPos.z;
+    const dx = playerPos.x - here.x;
+    const dy = playerPos.y - here.y;
+    const dz = playerPos.z - here.z;
 
     // Steering is horizontal by design so enemies never climb towards a
-    // player's head; melee gets the height separately.
+    // player's head; melee gets the height difference separately.
     const distance = Math.sqrt(dx * dx + dz * dz);
     if (distance < 0.001) {
-      return;
+      return null;
     }
 
     const toPlayerX = dx / distance;
@@ -649,21 +658,11 @@ class TargetHealth extends hz.Component<typeof TargetHealth> {
       this.preferredSide = 0;
       this.sideCommitCountdown = 0;
       this.blockedSeconds = 0;
-      return;
+      return null;
     }
 
-    this.walk(deltaTime, myPos, distance, toPlayerX, toPlayerZ);
-  }
-
-  private walk(
-    deltaTime: number,
-    from: hz.Vec3,
-    distance: number,
-    toPlayerX: number,
-    toPlayerZ: number,
-  ) {
     const heading = this.currentHeading(
-      from,
+      here,
       toPlayerX,
       toPlayerZ,
       deltaTime,
@@ -675,32 +674,34 @@ class TargetHealth extends hz.Component<typeof TargetHealth> {
 
       if (this.blockedSeconds < this.props.unstickAfterSeconds) {
         this.debug(
-          `blocked at ${from.toString()} (${this.blockedSeconds.toFixed(1)}s)`,
+          `blocked at ${here.toString()} (${this.blockedSeconds.toFixed(1)}s)`,
         );
-        return;
+        return null;
       }
 
       // Boxed in on every whisker for too long. Shove forward rather than
       // stand still forever - a spawn inside geometry would never recover.
       this.debug('unsticking - forcing a step');
-      this.step(from, toPlayerX, toPlayerZ, this.props.moveSpeed * deltaTime);
-      return;
+
+      const forced = this.props.moveSpeed * deltaTime;
+      return {
+        x: here.x + toPlayerX * forced,
+        z: here.z + toPlayerZ * forced,
+      };
     }
 
     this.blockedSeconds = 0;
     this.face(heading.x, heading.z);
 
-    const distanceToStop = distance - this.props.stopDistance;
-    const step = Math.min(this.props.moveSpeed * deltaTime, distanceToStop);
-
-    this.step(from, heading.x, heading.z, step);
-  }
-
-  /** Horizontal move only. Height belongs to applyGroundHeight. */
-  private step(from: hz.Vec3, dirX: number, dirZ: number, distance: number) {
-    this.entity.position.set(
-      new hz.Vec3(from.x + dirX * distance, from.y, from.z + dirZ * distance),
+    const step = Math.min(
+      this.props.moveSpeed * deltaTime,
+      distance - this.props.stopDistance,
     );
+
+    return {
+      x: here.x + heading.x * step,
+      z: here.z + heading.z * step,
+    };
   }
 
   // =====================================================================
